@@ -46,13 +46,20 @@ matte (tools)        on demand        docker compose --profile tools run --rm ma
 | `docker/Dockerfile` | `cameramatch-pi4`: CUDA 13, torch 2.12.1+cu130, Pi4 pinned to commit `32dfbea`, scipy |
 | `docker/Dockerfile.matte` | `cameramatch-matte`: SAM 2.1, MatAnyone 2, OpenCV, scipy, Open3D, OpenEXR |
 | `server/server.py` | Pi4 solve and refine jobs; writes `result.npz` and `pi4_cache.npz` |
-| `server/refine.py` | KLT tracks plus IRLS bundle adjustment (analytic Jacobian via torch, scipy TRF+LSMR) |
+| `server/refine.py` | KLT tracks, point initialisation, IRLS driver; legacy scipy TRF+LSMR solver (class `BA`) |
+| `server/ba_lm.py` | Default solver: GPU Levenberg-Marquardt with Schur complement, optional per-frame focal (zoom) |
+| `server/bench_ba.py` | Compares the solvers on any job, with ground-truth metrics |
 | `server/progress.py` | Per-job stages, weights and log, served at `/progress` (copied as `tools/progress.py`) |
 | `blender_addon/cameramatch_pi4/` | The extension (v0.5.0): `__init__.py` (UI, operators, progress), `set_builder.py` (floor fit, set, render setup), `robot.py` (rig, walk, materials). Installed as a copy, see §9 |
 | `tools/` | Host-side pipeline scripts (matte, mesh, environment map, composite) |
 | `tests/` | Blender scene builders, render drivers, validation scripts |
 | `work/` | Job folders (`<clip>_<date>_<time>/`) and per-shot outputs |
 | `samples/` | Source clips. The full Tears of Steel film is in `samples/tos/` |
+
+**Robustness tools (v0.6.0):**
+- **Set Scale from Distance:** writes `<job>/scene_scale.json`. The import records the scale it actually
+  applied on the scene (`cm_applied_scale`), and Set Scale computes from that, not from the file.
+- **Export Tracks to Clip:** writes `Pi4_####` tracks from `track_obs_full`.
 
 **Contents of a job folder** (`work/<clip>_<timestamp>/`):
 - `input/`: the source clip.
@@ -109,6 +116,7 @@ street walls are detected along the camera's travel direction, with no fixed +Y 
 | Refine at Plate Resolution | on | KLT plus bundle adjustment |
 | Solve Lens Distortion | on | **Turn off for slow or long-lens shots**: k1/k2 is poorly constrained and drags the focal |
 | Lock Focal to Pi4 | off | **Turn on for slow cinema shots** (sets focal_sigma to 0.002) |
+| Zoom Lens (Animate Focal) | off | Per-frame focal with a smoothness prior; the lens is keyframed |
 | Active Tracks | 600 | Tested sweet spot. More tracks make the solver slower without improving accuracy |
 | Max Frames / Stride / Model Resolution | 300 / 1 / 512 | GPU budget: 300 frames ≈ 12 GB, about 80 s |
 | Refine Matte After Solve | off | Runs the matte server automatically after a solve |
@@ -140,6 +148,9 @@ Headless drivers:
 masked, points are initialised by midpoint triangulation, and IRLS bundle adjustment (Huber, then
 Cauchy) solves every pose, every point, the focal and k1/k2. Each track is capped at 40
 observations.
+
+Benchmarks (LM vs scipy, zoom) are in README, "Solver and robustness tools". LM: 5–6× faster for the
+same minimum; 225k observations in under a minute.
 
 ### 5.2 Matte (`tools/matte_pipeline.py`, via matte-server)
 SAM 2.1 seeds every 30 frames, MatAnyone 2 is re-seeded in chunks, and the two are fused. The mode
@@ -245,6 +256,7 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
 - In Git Bash, set `MSYS_NO_PATHCONV=1` for docker commands. Write Python edits with
   `PYTHONUTF8=1` or an explicit `encoding="utf-8"`; the host default is cp1252.
 - Blender 5.x API changes:
+  - tracking markers: `track.markers.insert_frame(frame, co=...)` (`co` must be a keyword argument);
   - multilayer EXR needs `image_settings.media_type = "MULTI_LAYER_IMAGE"`;
   - `action.fcurves` is gone (layered actions), so set `preferences.edit.keyframe_new_interpolation_type`
     before inserting keys;
@@ -265,9 +277,10 @@ Most of the real bugs were caught this way.
 
 ## 8. Known limits and next steps
 
-- One focal per shot (no zooms). Principal point fixed at the centre. k1/k2 only.
-- The solver slows down past about 2000 active tracks. A Schur-complement LM or Ceres backend is the
-  next step.
+- Zooms: per-frame focal, but k1/k2 are constant. The principal point is fixed. The first frames of a zoom
+  are less accurate.
+- Many tracks don't improve accuracy on the shots tested so far (they add weaker features), even though they're
+  cheap now.
 - Pi4 depth can be non-rigid on unusual footage (the reframed 360 clip). Multi-view stereo on the
   solved cameras would fix the set geometry there.
 - The robot is built from primitives. The next step in realism is a modelled, high-detail asset that

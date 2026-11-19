@@ -1,6 +1,7 @@
 """Render a synthetic ground-truth plate (undistorted, with overscan) + export GT camera.
 
-blender -b --factory-startup --python tests/gt_render.py -- <out_dir> [frames]
+blender -b --factory-startup --python tests/gt_render.py -- <out_dir> [frames] [zoom]
+zoom > 1: smooth zoom-in over the shot (focal x zoom at the end); per-frame focal in gt.json f_px_frames.
 Final plate: 1920x1080, f = 1280 px (24 mm on 36 mm). Rendered with 1.2x overscan at the
 same pixel focal so the distortion step (tests/gt_distort.py) has pixels to pull from.
 """
@@ -16,6 +17,7 @@ from mathutils import Euler, Vector
 argv = sys.argv[sys.argv.index("--") + 1:]
 out = os.path.abspath(argv[0])
 N = int(argv[1]) if len(argv) > 1 else 120
+ZOOM = float(argv[2]) if len(argv) > 2 else 1.0
 W, H, F_PX, OVER = 1920, 1080, 1280.0, 1.2
 os.makedirs(os.path.join(out, "undist"), exist_ok=True)
 random.seed(1)
@@ -101,12 +103,17 @@ for i in range(N):
     cam.location, cam.rotation_euler = pos, rot
     cam.keyframe_insert("location", frame=i + 1)
     cam.keyframe_insert("rotation_euler", frame=i + 1)
+    zf = 1 + (ZOOM - 1) * t * t * (3 - 2 * t)
+    cam_data.lens = F_PX * zf / Wr * 36.0
+    cam_data.keyframe_insert("lens", frame=i + 1)
+f_frames = []
 for i in range(N):
     scene.frame_set(i + 1)
     gt.append([list(r) for r in cam.matrix_world])
+    f_frames.append(cam_data.lens / 36.0 * Wr)
     scene.render.filepath = os.path.join(out, "undist", f"{i:06d}.png")
     bpy.ops.render.render(write_still=True)
 
 with open(os.path.join(out, "gt.json"), "w") as fh:
-    json.dump(dict(c2w_blender=gt, f_px=F_PX, plate=[W, H], render=[Wr, Hr]), fh)
+    json.dump(dict(c2w_blender=gt, f_px=F_PX, f_px_frames=f_frames, zoom=ZOOM, plate=[W, H], render=[Wr, Hr]), fh)
 print("GT DONE", out)

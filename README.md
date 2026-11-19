@@ -58,6 +58,7 @@ You get a collection `Pi4_<clip>`:
   to distort CG renders to match the plate.
 
 Settings: *Refine at Plate Resolution* (default on), *Active Tracks* (600 is the tested sweet spot),
+*Zoom Lens (Animate Focal)* (per-frame focal for zoom shots),
 *Frame Stride* / *Max Frames* / *Model Resolution* (GPU memory budget), *Animate Focal Length* (π⁴ only).
 
 ## RTX 5090 budget (512 px, motion detection on)
@@ -68,14 +69,51 @@ Settings: *Refine at Plate Resolution* (default on), *Active Tracks* (600 is the
 | 750 | ~34 GB (upstream figure): turn motion off or raise stride | — |
 
 ## Known limits
-- **Metric scale is unreliable:** π⁴'s estimate was 2.5× off on the synthetic scene. Treat units as relative
-  and rescale the scene from a known measurement.
-- One constant focal when refining (no zooms yet); principal point fixed at centre; k1/k2 only (no tangential).
-- The refinement solver (scipy TRF + IRLS) converges slowly beyond ~2000 active tracks. More tracks currently
-  hurts. A Schur-complement LM / Ceres backend is the next step for long or dense shots.
+- **Metric scale is unreliable:** π⁴'s estimate was 2.5× off on the synthetic scene. Use **Set Scale from
+  Distance** (two points of known distance) to fix it.
+- Zooms: one focal per frame with a smoothness prior (*Zoom Lens*). k1/k2 stay constant through the zoom,
+  the principal point is fixed at the centre, and there is no tangential distortion. On a 1.7× synthetic zoom
+  the focal error is 1 % median, but the first frames are less accurate (about 8 % at the start of the zoom).
+- More tracks are now cheap (3000 tracks / 225k observations: 53 s of bundle adjustment), but on the shots tested
+  they don't lower the error: 600 remains the default.
 - Pure nodal pans: depth is unobservable; the solve is held up by the π⁴ priors.
 - Video decoded with OpenCV (H.264/H.265/MJPEG fine; ProRes may not be). TIFF/EXR sequences unsupported.
 - Upstream π⁴ is very new (released 2026-11-17); pinned to commit `32dfbea`.
+
+## Solver and robustness tools (v0.6.0)
+**Bundle adjustment:** `server/ba_lm.py`, a GPU Levenberg-Marquardt solver with Schur complement. The 3D
+points are eliminated per point (3×3 blocks), the reduced camera system is solved by dense Cholesky, and
+IRLS gives the robust Cauchy/Huber passes. Same model and priors as before; the old scipy TRF/LSMR solver stays
+available (`"solver": "scipy"`) and `server/bench_ba.py` compares both on any job.
+
+| Same tracks, RTX 5090 | scipy TRF + LSMR | **LM + Schur** |
+|---|---|---|
+| Synthetic GT (120 f, 23.5k obs): BA time | 40.6 s | **7.4 s** |
+| … trajectory / rotation / focal (GT 1280) | 0.071 % / 0.22° / 1280.8 px | 0.073 % / 0.23° / 1281.8 px |
+| Venice (284 f, 41k obs): BA time, median error | 71.7 s, 0.3475 px | **13.3 s, 0.3473 px** |
+| Venice, 3000 tracks (225k obs, 8.7M Schur pairs) | too slow | **53 s** |
+
+scipy stopped at its evaluation cap; LM reaches the true minimum of the same objective.
+
+**Zoom shots:** *Zoom Lens (Animate Focal)* solves one focal per frame, with a prior to Pi4's per-frame
+focal and a 1 %/frame smoothness prior. The camera lens is keyframed. On a synthetic 24 → 41 mm zoom:
+
+| | Pi4 alone | constant focal | **per-frame focal** |
+|---|---|---|---|
+| Focal error, median | 4.8 % | 21.6 % | **1.0 %** |
+| Trajectory error | — | 2.64 % | **0.78 %** |
+| Rotation error | — | 3.53° | **0.45°** |
+
+Test it with `tests/gt_render.py -- <dir> 120 1.7` (zoom factor) + `gt_distort.py`.
+
+**Set Scale from Distance:** select 2 vertices of the point cloud (Edit Mode) or 2 objects, then enter the
+real distance. The scale is saved in `<job>/scene_scale.json`, so re-imports and Build Set keep it.
+
+**Export Tracks to Clip:** the refined KLT tracks become Blender tracking markers (`Pi4_####`, full length,
+every frame), for inspection or Blender's own solver. On Venice: 1169 tracks, 162k markers, 0.32 px median
+from the solved projection.
+
+Checks: `blender -b <solved.blend> --python tests/check_robust_features.py -- [zoom_job first_png gt.json]`.
 
 ## Foreground matte refinement (MatAnyone 2)
 `tools/matte_pipeline.py` (on-demand `matte` image: SAM 2.1 Apache-2.0 + [MatAnyone 2](https://huggingface.co/PeiqingYang/MatAnyone2),

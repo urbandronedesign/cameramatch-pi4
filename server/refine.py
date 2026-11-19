@@ -248,6 +248,12 @@ class BA:
                             (1 / self.X_sigma).repeat_interleave(3).cpu().numpy()])
         return sp.csr_matrix((V, (R, Cc)), shape=(base + npts, len(x)))
 
+    def f_frames(self, x):
+        return np.full(self.T, self.f0 * np.exp(float(x[0])))
+
+    def k12(self, x):
+        return float(x[1]), float(x[2])
+
     def obs_errors(self, x):
         """Unweighted reprojection error (pixels) per observation."""
         intr, w, C, X, _ = self.unpack(x)
@@ -288,9 +294,11 @@ def _stats(e):
 
 
 def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nfev=50, quality=0.001,
-           focal_sigma=0.3, progress=None, solve_distortion=True):
+           focal_sigma=0.3, progress=None, solve_distortion=True, solver="lm", zoom=False, zoom_smooth=0.01):
     """result: dict from result.npz; cache: dict(depth [T,Hm,Wm] metric, dyn [T,Hm,Wm]).
-    progress(stage, frac, msg) is called with stages 'klt' and 'ba'."""
+    progress(stage, frac, msg) is called with stages 'klt' and 'ba'.
+    solver: "lm" (GPU Levenberg-Marquardt + Schur complement, ba_lm.py) or "scipy" (TRF + LSMR, class BA).
+    zoom: one focal per frame (LM solver only), prior to Pi4's per-frame focal + smoothness zoom_smooth."""
     prog = progress or (lambda *a, **k: None)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     c2w = result["c2w"].astype(np.float64)
@@ -300,6 +308,7 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
 
     obs, colors, plate = klt_tracks(src, result["frame_indices"], dyn, max_active=max_active, quality=quality,
                                     log=log, progress=progress)
+    obs_full = obs.copy()  # every KLT observation (exported to Blender's tracker for the kept tracks)
     # Slow shots give very long tracks; neighbouring observations add little but cost a lot of solver time.
     # Keep at most MAX_OBS evenly spaced observations per track (first and last always kept).
     MAX_OBS = 40
@@ -356,8 +365,17 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
 
     med_depth = float(np.median(depth[depth > 0]))
     obs_g = obs[good_pt[tid]]
-    ba = BA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
-            focal_sigma=focal_sigma, k_sigma=0.5 if solve_distortion else 1e-5)
+    k_sigma = 0.5 if solve_distortion else 1e-5
+    if solver == "lm":
+        from ba_lm import LMBA
+        f_init = np.asarray(result["fx"], np.float64).reshape(-1) * sx if zoom else None
+        ba = LMBA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
+                  focal_sigma=focal_sigma, k_sigma=k_sigma, zoom=zoom, f_init=f_init, zoom_smooth=zoom_smooth)
+    else:
+        if zoom:
+            log("[refine] zoom needs the LM solver: solving one constant focal")
+        ba = BA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
+                focal_sigma=focal_sigma, k_sigma=k_sigma)
     x = ba.x0.copy()
     e_init = ba.obs_errors(x)
     log(f"[refine] init reprojection: median {np.median(e_init):.2f}px p90 {np.percentile(e_init, 90):.1f}px")
@@ -382,13 +400,14 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
     prog("ba", 1.0, "bundle adjustment done")
     e2 = ba.obs_errors(x)
 
-    intr, w, C, X, _ = ba.unpack(x)
+    _, w, C, X, _ = ba.unpack(x)
     R = (_expmap(w) @ ba.R0).cpu().numpy()  # world->cam
     c2w_ref = np.tile(np.eye(4), (T, 1, 1))
     c2w_ref[:, :3, :3] = np.transpose(R, (0, 2, 1))
     c2w_ref[:, :3, 3] = C.cpu().numpy()
-    f = float(f0 * np.exp(float(intr[0])))
-    k1, k2 = float(intr[1]), float(intr[2])
+    f_fr = ba.f_frames(x)
+    f = float(np.median(f_fr))
+    k1, k2 = ba.k12(x)
 
     # Per-frame median error and the points that survived (â‰¥2 inlier observations).
     kf = kept_obs[:, 0].astype(int)
@@ -402,17 +421,21 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
     new_id[pts_ok] = np.arange(int(pts_ok.sum()))
     tob = kept_obs[pts_ok[kt]].copy()
     tob[:, 1] = new_id[tob[:, 1].astype(np.int64)]
+    full = obs_full[pts_ok[obs_full[:, 1].astype(np.int64)]].copy()
+    full[:, 1] = new_id[full[:, 1].astype(np.int64)]
     out = dict(
-        track_obs=tob.astype(np.float32),
+        track_obs=tob.astype(np.float32), track_obs_full=full.astype(np.float32),
         refined=np.array(True), c2w_refined=c2w_ref, f_px=np.array(f), k1=np.array(k1), k2=np.array(k2),
         plate_size=np.array([W, H]), principal_px=np.array([cx, cy]),
         track_points=X.cpu().numpy()[pts_ok].astype(np.float32), track_colors=colors[pts_ok],
         reproj_per_frame_px=per_frame.astype(np.float32),
+        f_px_frames=f_fr.astype(np.float64), zoom=np.array(bool(zoom and solver == "lm")),
     )
     stats = dict(init=_stats(e_init[ok0]), round1=_stats(e1), final=_stats(e2), outlier_thresh_px=thr,
                  prefilter_thresh_px=thr0, prefilter_kept=float(ok0.mean()),
                  tracks=int(pts_ok.sum()), observations=int(len(kept_obs)), plate=[W, H],
-                 f_px=f, f_px_pi4=f0, k1=k1, k2=k2)
+                 f_px=f, f_px_pi4=f0, k1=k1, k2=k2, solver=solver,
+                 f_px_range=[float(f_fr.min()), float(f_fr.max())])
     log(f"[refine] final reprojection: median {stats['final']['median']:.3f}px, p90 {stats['final']['p90']:.3f}px, "
         f"f {f0:.1f}->{f:.1f}px, k1 {k1:.4f}, k2 {k2:.4f}")
     return out, stats

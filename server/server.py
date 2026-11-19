@@ -243,7 +243,9 @@ def run_refine(req, started=False):
                            prior_frac=float(req.get("prior_frac", 0.1)),
                            quality=float(req.get("klt_quality", 0.001)),
                            focal_sigma=float(req.get("focal_sigma", 0.3)),
-                           solve_distortion=bool(req.get("solve_distortion", True)))
+                           solve_distortion=bool(req.get("solve_distortion", True)),
+                           solver=str(req.get("solver", "lm")), zoom=bool(req.get("zoom", False)),
+                           zoom_smooth=float(req.get("zoom_smooth", 0.01)))
     PROGRESS.update(job, "write", 0.5, "writing result")
     result.update(out)
     np.savez(res_path, **result)

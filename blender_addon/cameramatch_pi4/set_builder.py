@@ -231,6 +231,15 @@ def detect_street(P, coef, cams, log, wall_height=14.0):
 
 
 # --------------------------------------------------------------------------- main entry
+def _job_scale(job_dir):
+    import json
+    try:
+        with open(os.path.join(job_dir, "scene_scale.json")) as fh:
+            return float(json.load(fh)["scale"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 1.0
+
+
 def _clear_set():
     coll = bpy.data.collections.get(SET_COLL)
     if coll:
@@ -291,7 +300,7 @@ def build_set(scene, clip, job_dir, log, street_walls=True, wall_height=14.0):
     wall_rgb = np.array([0.06, 0.055, 0.05])
     if os.path.isfile(lp_path):
         lp = np.load(lp_path)
-        Vl, Fl, Cl = lp["verts"], lp["faces"], lp["colors"]
+        Vl, Fl, Cl = lp["verts"] * _job_scale(job_dir), lp["faces"], lp["colors"]
         me = bpy.data.meshes.new("CM_walls")
         me.vertices.add(len(Vl))
         me.vertices.foreach_set("co", Vl.ravel())

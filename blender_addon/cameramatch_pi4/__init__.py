@@ -155,9 +155,9 @@ class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
     conf_threshold: FloatProperty(name="Point Confidence", default=0.05, min=0.0, max=1.0,
                                   description="Minimum Pi4 geometry confidence for point cloud pixels")
     num_points: IntProperty(name="Max Points", default=200_000, min=0, max=5_000_000)
-    animate_focal: BoolProperty(name="Animate Focal Length", default=False,
-                                description="Keyframe per-frame focal (zoom shots, Pi4 only - "
-                                            "refinement solves one constant focal)")
+    animate_focal: BoolProperty(name="Zoom Lens (Animate Focal)", default=False,
+                                description="Zoom shots: solve one focal length per frame (smooth), keyframed on "
+                                            "the camera. Off: one constant focal for the whole shot")
     refine: BoolProperty(name="Refine at Plate Resolution", default=True,
                          description="KLT tracking + bundle adjustment at full resolution: refines poses, "
                                      "focal and k1/k2 lens distortion (Blender Polynomial model)")
@@ -288,6 +288,30 @@ def _points_node_group():
     return ng
 
 
+def job_scale(job_dir):
+    try:
+        with open(os.path.join(job_dir, "scene_scale.json")) as fh:
+            return float(json.load(fh)["scale"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 1.0
+
+
+def remove_imported(scene, clip):
+    """Delete a previous import of this clip's solve (collection, objects, mesh/camera data, mask clip)."""
+    name = f"Pi4_{clip.name}"
+    coll = bpy.data.collections.get(name)
+    if coll:
+        for ob in list(coll.objects):
+            data = ob.data
+            bpy.data.objects.remove(ob)
+            if data is not None and data.users == 0:
+                (bpy.data.cameras if isinstance(data, bpy.types.Camera) else bpy.data.meshes).remove(data)
+        bpy.data.collections.remove(coll)
+    mc = bpy.data.movieclips.get(name + "_motion_mask")
+    if mc:
+        bpy.data.movieclips.remove(mc)
+
+
 def import_result(scene, clip, job_dir, settings):
     d = np.load(os.path.join(job_dir, "result.npz"))
     refined = "refined" in d and bool(d["refined"])
@@ -296,14 +320,18 @@ def import_result(scene, clip, job_dir, settings):
     model_w = int(d["model_size"][0])
     frames = clip.frame_start + d["frame_indices"].astype(int)
 
-    # Express everything relative to the first solved camera, then convert axes.
-    anchor = CV_TO_BL_WORLD @ np.linalg.inv(c2w[0])
+    # Express everything relative to the first solved camera, then convert axes, then apply the job's
+    # real-world scale (Set Scale from Distance writes scene_scale.json).
+    sc_val = job_scale(job_dir)
+    scene["cm_applied_scale"] = sc_val          # what this import really used (Set Scale works from it)
+    anchor = np.diag([sc_val, sc_val, sc_val, 1.0]) @ CV_TO_BL_WORLD @ np.linalg.inv(c2w[0])
     mats = [anchor @ c2w[i] @ CV_TO_BL_CAM for i in range(T)]
 
     tcam = clip.tracking.camera
     sensor_w = tcam.sensor_width
     if refined:
-        lens = np.full(T, float(d["f_px"]) * sensor_w / int(d["plate_size"][0]))
+        f_fr = d["f_px_frames"] if "f_px_frames" in d and bool(d.get("zoom", False)) else np.full(T, float(d["f_px"]))
+        lens = np.asarray(f_fr, np.float64) * sensor_w / int(d["plate_size"][0])
     else:
         lens = d["fx"] * sensor_w / model_w
     lens_med = float(np.median(lens))
@@ -332,7 +360,7 @@ def import_result(scene, clip, job_dir, settings):
         cam.location, cam.rotation_quaternion = loc, q
         cam.keyframe_insert("location", frame=int(f))
         cam.keyframe_insert("rotation_quaternion", frame=int(f))
-        if settings.animate_focal and not refined:
+        if (settings.animate_focal and not refined) or (refined and bool(d.get("zoom", False))):
             cam_data.lens = float(ln)
             cam_data.keyframe_insert("lens", frame=int(f))
 
@@ -365,7 +393,7 @@ def import_result(scene, clip, job_dir, settings):
             ext = float(np.linalg.norm(np.percentile(pts_bl, 95, 0) - np.percentile(pts_bl, 5, 0)))
             radii = np.full(len(pts_bl), max(ext, 1e-3) * 0.0015, np.float32)
         rad = mesh.attributes.new("pi4_radius", "FLOAT", "POINT")
-        rad.data.foreach_set("value", radii)
+        rad.data.foreach_set("value", radii * sc_val)
         mesh.update()
         pobj = bpy.data.objects.new(name + "_points", mesh)
         mod = pobj.modifiers.new("Points", "NODES")
@@ -480,7 +508,7 @@ class CAMERAMATCH_OT_solve(bpy.types.Operator):
                        max_size=s.max_size - s.max_size % 16, track=s.track,
                        conf_threshold=s.conf_threshold, num_points=s.num_points,
                        refine=s.refine, max_tracks=s.max_tracks, solve_distortion=s.solve_distortion,
-                       focal_sigma=0.002 if s.lock_focal else 0.3)
+                       focal_sigma=0.002 if s.lock_focal else 0.3, zoom=s.animate_focal, solver="lm")
         url = prefs.server_url.rstrip("/") + "/solve"
 
         def worker():
@@ -633,6 +661,7 @@ class CAMERAMATCH_OT_reimport(bpy.types.Operator):
 
     def execute(self, context):
         s = context.scene.cameramatch
+        remove_imported(context.scene, context.edit_movieclip)
         import_result(context.scene, context.edit_movieclip, s.last_job, s)
         return {"FINISHED"}
 
@@ -763,6 +792,137 @@ class CAMERAMATCH_OT_add_robot(bpy.types.Operator):
             return {"CANCELLED"}
         _sync_log_text()
         self.report({"INFO"}, _STATUS["log"][-1][9:] if _STATUS["log"] else "robot added")
+        return {"FINISHED"}
+
+
+def _selected_pair(context):
+    """Two 3D points to measure: 2 selected vertices (Edit Mode) or 2 selected objects. Returns (a, b, label)."""
+    ob = context.active_object
+    if ob is not None and ob.mode == "EDIT" and ob.type == "MESH":
+        import bmesh
+        bm = bmesh.from_edit_mesh(ob.data)
+        vs = [v for v in bm.verts if v.select]
+        if len(vs) == 2:
+            return ob.matrix_world @ vs[0].co, ob.matrix_world @ vs[1].co, f"2 vertices of {ob.name}"
+        return None, None, f"select exactly 2 vertices ({len(vs)} selected)"
+    obs = list(context.selected_objects)
+    if len(obs) == 2:
+        a, b = obs[0].matrix_world.translation.copy(), obs[1].matrix_world.translation.copy()
+        return a, b, f"objects {obs[0].name} / {obs[1].name}"
+    return None, None, "select 2 vertices (Edit Mode on the point cloud) or 2 objects (e.g. empties snapped to it)"
+
+
+class CAMERAMATCH_OT_set_scale(bpy.types.Operator):
+    bl_idname = "cameramatch.set_scale"
+    bl_label = "Set Scale from Distance"
+    bl_description = ("Rescale the whole solve (camera path, point cloud, tracks, set) so the distance between two "
+                      "selected points (2 vertices in Edit Mode, or 2 objects) equals a real measurement")
+    bl_options = {"REGISTER", "UNDO"}
+
+    real_distance: FloatProperty(name="Real Distance", default=1.0, min=1e-4, unit="LENGTH",
+                                 description="The true distance between the two selected points")
+    measured: FloatProperty(name="Measured", default=0.0, options={"HIDDEN", "SKIP_SAVE"})
+
+    @classmethod
+    def poll(cls, context):
+        return _job_ok(context) and not _STATUS["running"] and _main_clip(context) is not None
+
+    def invoke(self, context, event):
+        a, b, label = _selected_pair(context)
+        if a is None:
+            self.report({"ERROR"}, label)
+            return {"CANCELLED"}
+        self.measured = (a - b).length
+        if self.measured < 1e-6:
+            self.report({"ERROR"}, "the two points coincide")
+            return {"CANCELLED"}
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.label(text=f"Measured: {self.measured:.4f} (scene units)")
+        col.prop(self, "real_distance")
+
+    def execute(self, context):
+        if self.measured <= 0:
+            a, b, label = _selected_pair(context)
+            if a is None:
+                self.report({"ERROR"}, label)
+                return {"CANCELLED"}
+            self.measured = (a - b).length
+        sc = context.scene
+        s = sc.cameramatch
+        job = s.last_job
+        old = float(sc.get("cm_applied_scale", 1.0))   # scale of the solve currently in the scene
+        new = old * self.real_distance / self.measured
+        if context.active_object is not None and context.active_object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        with open(os.path.join(job, "scene_scale.json"), "w") as fh:
+            json.dump({"scale": new, "measured": self.measured, "real": self.real_distance}, fh)
+        clip = _main_clip(context)
+        frame = sc.frame_current
+        remove_imported(sc, clip)
+        import_result(sc, clip, job, s)
+        sc.frame_set(frame)
+        msg = f"scale x{new / old:.4f} (job scale {new:.4f}): {self.measured:.3f} -> {self.real_distance:.3f}"
+        if bpy.data.collections.get(set_builder.SET_COLL):
+            set_builder.build_set(sc, clip, job, _log, street_walls=s.set_street_walls,
+                                  wall_height=s.set_wall_height)
+            msg += "; set rebuilt"
+        if any(c.name.startswith("CM_Robot") for c in bpy.data.collections):
+            msg += "; re-add robots (they were placed at the old scale)"
+        _log("Set Scale: " + msg)
+        _sync_log_text()
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class CAMERAMATCH_OT_export_tracks(bpy.types.Operator):
+    bl_idname = "cameramatch.export_tracks"
+    bl_label = "Export Tracks to Clip"
+    bl_description = ("Write the refined KLT tracks into the clip's tracker (Movie Clip Editor tracks named "
+                      "Pi4_####), replacing previously exported ones")
+    bl_options = {"REGISTER", "UNDO"}
+
+    max_tracks: IntProperty(name="Max Tracks", default=1500, min=1, max=100000)
+
+    @classmethod
+    def poll(cls, context):
+        return _job_ok(context) and _main_clip(context) is not None
+
+    def execute(self, context):
+        clip = _main_clip(context)
+        d = np.load(os.path.join(context.scene.cameramatch.last_job, "result.npz"))
+        key = "track_obs_full" if "track_obs_full" in d else ("track_obs" if "track_obs" in d else None)
+        if key is None:
+            self.report({"ERROR"}, "no refined tracks in this solve (enable Refine at Plate Resolution)")
+            return {"CANCELLED"}
+        ob = d[key]
+        W, H = clip.size
+        fidx = d["frame_indices"].astype(int)
+        tracks = clip.tracking.tracks
+        for t in [t for t in tracks if t.name.startswith("Pi4_")]:
+            tracks.remove(t)
+        tid = ob[:, 1].astype(np.int64)
+        order = np.lexsort((ob[:, 0], tid))
+        ob, tid = ob[order], tid[order]
+        starts = np.r_[0, np.nonzero(np.diff(tid))[0] + 1]
+        ends = np.r_[starts[1:], len(ob)]
+        pick = np.argsort(-(ends - starts))[: self.max_tracks]          # longest tracks first
+        n_mark = 0
+        for k in pick:
+            rows = ob[starts[k]:ends[k]]
+            fr = fidx[rows[:, 0].astype(int)] + 1                       # clip-local frame numbers start at 1
+            tr = tracks.new(name=f"Pi4_{int(tid[starts[k]]):04d}", frame=int(fr[0]))
+            for f_, u, v in zip(fr, rows[:, 2], rows[:, 3]):
+                tr.markers.insert_frame(int(f_), co=((u + 0.5) / W, 1.0 - (v + 0.5) / H))
+            end = tr.markers.insert_frame(int(fr[-1]) + 1, co=((rows[-1, 2] + 0.5) / W, 1.0 - (rows[-1, 3] + 0.5) / H))
+            end.mute = True
+            tr.select = False
+            n_mark += len(rows)
+        msg = f"exported {len(pick)} tracks ({n_mark} markers) from {key}"
+        _log(msg)
+        self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
@@ -963,6 +1123,11 @@ class CAMERAMATCH_PT_panel(bpy.types.Panel):
         layout.operator("cameramatch.solve", icon="CAMERA_DATA")
         layout.operator("cameramatch.reimport", icon="FILE_REFRESH")
         box = layout.box()
+        box.label(text=f"Scene Scale: x{job_scale(s.last_job):.4f}" if s.last_job else "Scene Scale",
+                  icon="DRIVER_DISTANCE")
+        box.operator("cameramatch.set_scale", icon="FIXED_SIZE")
+        box.operator("cameramatch.export_tracks", icon="TRACKER")
+        box = layout.box()
         box.label(text="Foreground Matte", icon="MOD_MASK")
         box.operator("cameramatch.refine_matte", icon="MATSHADERBALL")
         box.prop(s, "auto_matte")
@@ -1000,7 +1165,8 @@ class CAMERAMATCH_PT_panel(bpy.types.Panel):
 classes = (CAMERAMATCH_Prefs, CAMERAMATCH_Settings, CAMERAMATCH_OT_check_server,
            CAMERAMATCH_OT_solve, CAMERAMATCH_OT_reimport, CAMERAMATCH_OT_refine_matte, CAMERAMATCH_OT_show_log,
            CAMERAMATCH_OT_clear_log, CAMERAMATCH_OT_build_set, CAMERAMATCH_OT_place_on_floor,
-           CAMERAMATCH_OT_add_robot, CAMERAMATCH_OT_render_comp, CAMERAMATCH_PT_panel, CAMERAMATCH_PT_view3d)
+           CAMERAMATCH_OT_add_robot, CAMERAMATCH_OT_render_comp, CAMERAMATCH_OT_set_scale,
+           CAMERAMATCH_OT_export_tracks, CAMERAMATCH_PT_panel, CAMERAMATCH_PT_view3d)
 
 
 def _statusbar_progress(self, context):
