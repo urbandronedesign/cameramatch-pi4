@@ -189,6 +189,8 @@ Y-up world = Blender (x, z, -y). Frames are numbered like the Blender scene ({f0
 same frame rate in the other application before importing (Alembic is time-based).
 
 {name}.abc / .fbx / .usdc   camera (animated transform + focal), set meshes, track points, locators (trk_#####)
+                            CG characters keep their materials in USD (preview surfaces, textures/ folder) and
+                            FBX (textures embedded); Alembic carries geometry only (no materials).
 {name}.nk                   Nuke: Camera3, plate, undistort / redistort STMaps, sequences below, ReadGeo
 camera.json / camera.csv    per-frame camera, sensor, lens distortion (formula inside), rolling shutter
 stmap_undistort.exr         plate -> undistorted (Nuke STMap convention, 32-bit)
@@ -200,6 +202,11 @@ masks/trees_water_sky_####.png  trees / water / sky (semantic, when the solve us
 masks/matte_####.png        foreground matte (MatAnyone 2, when Refine Matte was run)
 masks/ignore_####.png       your Ignore Mask (when drawn)
 depth/depth_####.exr        depth, 32-bit float channel "Z", metres along the optical axis (Z-depth)
+lighting/plate_env.png      the lighting environment the add-on renders with: an equirectangular map built from
+                            the plate (Blender world convention, Z up: in a Y-up application rotate it -90 deg about X
+                            if it does not convert). Use it as the world / dome light, no other lights.
+Set geometry (CM_floor_catcher, CM_walls, CM_street_walls): use as shadow catchers / matte objects, hidden from
+the camera except for shadows (the add-on renders them as Cycles shadow catchers).
 
 Masks and depth are at plate resolution, upscaled from the model's resolution, and follow the plate's lens
 (distorted, like the plate). Depth is Pi4's per-frame depth scaled to agree with the solved camera (median over
@@ -328,12 +335,13 @@ def export_scene(context, out_dir, name="cameramatch", formats=FORMATS, include_
                                          bake_anim_force_startend_keying=True, bake_anim_step=1.0,
                                          bake_anim_simplify_factor=0.0, add_leaf_bones=False,
                                          axis_forward="-Z", axis_up="Y", apply_scale_options="FBX_SCALE_ALL",
-                                         use_custom_props=False)
+                                         use_custom_props=False, path_mode="COPY", embed_textures=True)
                 written["fbx"] = p
             if "usd" in formats:
                 p = os.path.join(out_dir, name + ".usdc")
                 bpy.ops.wm.usd_export(filepath=p, selected_objects_only=True, export_animation=True,
-                                      export_materials=False, export_cameras=True, export_meshes=True,
+                                      export_materials=True, generate_preview_surface=True,
+                                      export_textures_mode="NEW", export_cameras=True, export_meshes=True,
                                       export_lights=False, export_armatures=False,   # characters: baked meshes
                                       convert_orientation=True, export_global_up_selection="Y",
                                       export_global_forward_selection="NEGATIVE_Z")
@@ -365,6 +373,12 @@ def export_scene(context, out_dir, name="cameramatch", formats=FORMATS, include_
         write_nuke(p, sc, cam, rows, meta.get("plate", ""), os.path.basename(written["abc"]) if "abc" in written
                    else "", W, H, has_maps)
         written["nk"] = p
+    env = os.path.join(bpy.path.abspath(meta.get("job_dir", "")), "plate_env.png") if meta.get("job_dir") else ""
+    if env and os.path.isfile(env):
+        import shutil
+        os.makedirs(os.path.join(out_dir, "lighting"), exist_ok=True)
+        shutil.copy2(env, os.path.join(out_dir, "lighting", "plate_env.png"))
+        written["lighting"] = os.path.join(out_dir, "lighting", "plate_env.png")
     write_readme(out_dir, name, sc)
     log(f"export: {len(objs)} objects, frames {f0}-{f1} -> " + ", ".join(os.path.basename(v) for v in written.values()))
     return written

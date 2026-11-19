@@ -1967,6 +1967,7 @@ class CAMERAMATCH_OT_export_scene(bpy.types.Operator):
         meta = dict(result={k: float(d[k]) for k in ("k1", "k2") if k in d},
                     track_obs=d["track_obs_full"] if "track_obs_full" in d else None,
                     plate=bpy.path.abspath(clip.filepath) if clip else "",
+                    job_dir=s.last_job,
                     generator="CameraMatch Pi4 " + ".".join(str(v) for v in _version()),
                     solve=dict(median_px=stats.get("final", {}).get("median"), p90_px=stats.get("final", {}).get("p90"),
                                job=os.path.basename(os.path.normpath(s.last_job))))

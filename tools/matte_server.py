@@ -143,6 +143,19 @@ def _do_maps(name, req):
     return dict(out="export_maps", summary=rep)
 
 
+def _lens(job):
+    """The solved lens (k1, k2, focal in plate pixels) from the job's result: the comp distorts the pinhole CG."""
+    import numpy as np
+    try:
+        with np.load(os.path.join(job, "result.npz")) as r:
+            if "k1" not in r.files:
+                return {}
+            f = float(np.median(r["f_px_frames"])) if "f_px_frames" in r.files else float(r["f_px"])
+            return dict(k1=float(r["k1"]), k2=float(r["k2"]), f_px=f)
+    except (OSError, KeyError, ValueError):
+        return {}
+
+
 def _do_comp(name, req):
     job = _job_dir(name)
     log = lambda s: PROGRESS.log(name, s)  # noqa: E731
@@ -153,7 +166,8 @@ def _do_comp(name, req):
     comp_plate.PROGRESS_HOOK = lambda fr, msg: PROGRESS.update(name, "comp", fr, msg)
     try:
         done = comp_plate.run(plate, rdir, odir, frames=req.get("frames"), grain=req.get("grain", "auto"),
-                              soft=float(req.get("soft", 0.6)), wrap=float(req.get("wrap", 0.25)))
+                              soft=float(req.get("soft", 0.6)), wrap=float(req.get("wrap", 0.25)),
+                              **_lens(job))
     finally:
         comp_plate.LOG_HOOK = comp_plate.PROGRESS_HOOK = None
     fps = float(req.get("fps", 25.0))

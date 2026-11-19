@@ -140,6 +140,29 @@ Advanced settings: *Refine at Plate Resolution* (default on), *Active Tracks* (6
 - Video decoded with OpenCV (H.264/H.265/MJPEG fine; ProRes may not be). TIFF/EXR sequences unsupported.
 - Upstream π⁴ is very new (released 2026-11-17); pinned to commit `32dfbea`.
 
+## The same shot rebuilt from the export only (v0.13.1)
+Test: the Venice guided shot (k1 0.153, imported character + robot, rolling shutter) exported, then rebuilt in a
+**factory-start Blender with no add-on** from the export folder only (`tests/rebuild_from_export.py`: USD import,
+`camera.json` for resolution / fps / rolling shutter, set meshes as shadow catchers, `lighting/plate_env.png` as
+the world), composited the way Nuke would (plate PNG x shadow + CG through `stmap_redistort.exr`), and compared
+with the plugin's own render and comp on 12 frames (`tests/compare_export_rebuild.py`).
+
+| | Result |
+|---|---|
+| CG silhouettes, pinhole renders (camera + geometry + animation transfer) | IoU 0.987-0.999, centroids within 0.38 px |
+| CG position, plugin comp vs export comp | 0.09 px median, 0.47 px max |
+| Plate / shadows outside the CG | mean difference 0.0008 |
+| CG colour | mean difference 0.02 (the plugin's comp adds grain, black-level match, light wrap and plate-projected bounce) |
+
+Found and fixed by this test:
+- **The plugin's comp did not apply the lens distortion to the CG** (it laid the pinhole render on the distorted
+  plate): 1.1 px median / 2.9 px max offset on this shot's centred characters, about 5 % of the distance to the
+  centre at the edges. `comp_plate` now distorts the CG and its shadow pass with the solved k1 / k2 (read by the
+  matte server from the job), the same mapping as `stmap_redistort.exr`.
+- **Characters lost their materials outside Blender:** Alembic has none. USD now exports preview-surface
+  materials with a `textures/` folder and FBX embeds its textures.
+- **Lighting:** the export now includes `lighting/plate_env.png`, the environment the add-on renders with.
+
 ## Export to other software (v0.13.0)
 **Export Camera + Scene** (guided panel, below the steps, once a shot is solved) writes into one folder
 (default `<job>/export`):

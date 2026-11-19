@@ -359,6 +359,9 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
   5.3's USD armature writer hits "Code marked as unreachable" on these rigs, so characters go to USD as baked
   meshes. Compare exports by reprojection in pixels, not by matrices. A scene whose track mesh no longer matches
   `result.npz` (re-solved, not re-imported) is flagged on export.
+- Rebuilding a shot from its export only (v0.13.1) exposed that Render & Comp never distorted the CG (pinhole
+  render over the distorted plate): `comp_plate` now applies k1/k2 (matte server reads them from the job).
+  Alembic carries no materials: hand characters over as USD (preview surfaces + textures/) or FBX.
 - Exported depth: compare it with the solve at the OBSERVED pixels (lens distortion moves points tens of pixels
   at the edges; a pinhole projection samples the wrong depth). Pi4 depth vs solve: 4 % per point on Venice,
   27 % on the ToS bridge. One global factor; per-frame factors chase the track subset (the frames with ~500

@@ -5,6 +5,8 @@ Also used by matte_server.py (POST /comp) through run().
 - plate x Shadow Catcher pass (physical CG shadows / occlusion of the real light)
 - CG black level + softness matched to the plate (measured), light wrap from the plate
 - grain measured from the plate's high-frequency noise (flat regions), added to the CG only
+- lens: the pinhole CG render and its shadow pass are put through the solved lens distortion (k1, k2) first,
+  so the CG sits where the plate's lens puts it (Blender Polynomial model, principal point at the centre)
 Frames: r_####.exr, #### = 1-based plate frame number. Writes comp_####.png (sRGB 8-bit).
 """
 import argparse
@@ -15,6 +17,19 @@ import re
 import cv2
 import numpy as np
 import OpenEXR
+
+
+def lens_maps(W, H, f_px, k1, k2, iters=30):
+    """cv2.remap maps for the plate's lens: a distorted (plate) pixel reads the pinhole render at undistort(p).
+    Pixel centres at integer + 0.5 (same convention as the exported ST maps)."""
+    u, v = np.meshgrid(np.arange(W) + 0.5, np.arange(H) + 0.5)
+    xd, yd = (u - W / 2) / f_px, (v - H / 2) / f_px
+    x, y = xd.copy(), yd.copy()
+    for _ in range(iters):
+        r2 = x * x + y * y
+        g = 1 + k1 * r2 + k2 * r2 * r2
+        x, y = xd / g, yd / g
+    return (x * f_px + W / 2 - 0.5).astype(np.float32), (y * f_px + H / 2 - 0.5).astype(np.float32)
 
 
 def srgb2lin(x):
@@ -60,7 +75,7 @@ def _log(msg):
         LOG_HOOK(msg)
 
 
-def run(plate, exr_dir, out, frames=None, grain="auto", soft=0.6, wrap=0.25, lift="auto"):
+def run(plate, exr_dir, out, frames=None, grain="auto", soft=0.6, wrap=0.25, lift="auto", k1=0.0, k2=0.0, f_px=0.0):
     """Composite every r_####.exr in exr_dir (or `frames`) -> out/comp_####.png. Returns written frame numbers."""
     os.makedirs(out, exist_ok=True)
     exrs = {int(re.findall(r"(\d+)\.exr$", p)[0]): p for p in glob.glob(os.path.join(exr_dir, "r_*.exr"))}
@@ -78,12 +93,14 @@ def run(plate, exr_dir, out, frames=None, grain="auto", soft=0.6, wrap=0.25, lif
         if ok:
             samp.append(fr)
     blk, grn = plate_stats(samp)            # BGR order
+    plate_w = samp[0].shape[1] if samp else 1
     if lift != "auto":
         blk = np.full(3, float(lift))
     if grain != "auto":
         grn = np.full(3, float(grain))
     _log(f"plate black level {np.round(blk[::-1], 4)} (RGB, display), grain std {np.round(grn[::-1], 4)}")
     rng = np.random.default_rng(7)
+    lens = None                                      # built on the first frame (render size known then)
     cap = cv2.VideoCapture(plate)
     cur, done = 0, []
     for k, fnum in enumerate(want):
@@ -108,6 +125,15 @@ def run(plate, exr_dir, out, frames=None, grain="auto", soft=0.6, wrap=0.25, lif
             # preview render (reduced resolution percentage): comp at the render's size
             plate_fr = cv2.resize(plate_fr, (cg.shape[1], cg.shape[0]), interpolation=cv2.INTER_AREA)
         shad = np.clip(E["Shadow Catcher"][..., ::-1], 0, 1.5) if "Shadow Catcher" in E else 1.0
+        if (abs(k1) > 1e-6 or abs(k2) > 1e-6) and f_px > 0:
+            if lens is None:
+                s_ = cg.shape[1] / plate_w                  # preview renders are smaller than the plate
+                lens = lens_maps(cg.shape[1], cg.shape[0], f_px * s_, k1, k2)
+                _log(f"lens: CG distorted to the plate's lens (k1 {k1:.4f}, k2 {k2:.4f}, f {f_px:.1f}px)")
+            cg = cv2.remap(cg, lens[0], lens[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            if not np.isscalar(shad):
+                shad = cv2.remap(np.ascontiguousarray(shad), lens[0], lens[1], cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(1, 1, 1))
         pl = srgb2lin(plate_fr.astype(np.float32) / 255.0)
         bg = pl * shad
         if soft > 0:
