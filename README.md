@@ -42,7 +42,8 @@ work/                    shared jobs folder (host <-> container)
 2. `docker compose up -d --build` (first start downloads the weights from Hugging Face `yyfz233/Pi4`; no token needed).
 3. `docker compose logs -f pi4` until `model ready`.
 4. Blender 5.3 > Edit > Preferences > Get Extensions > ⌄ > Install from Disk > `dist/cameramatch_pi4-0.5.0.zip`.
-   In the add-on preferences, check **Work folder** points at this repo's `work/`.
+   In the add-on preferences, set **Work folder** to this repo's `work/` folder (the default is the author's
+   local path). It must be the folder docker-compose mounts as `/work`.
 
 ## Use
 Movie Clip Editor > open a clip (movie file or PNG/JPG sequence) > set the clip's **sensor width**
