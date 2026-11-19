@@ -18,7 +18,7 @@ import torch
 
 class LMBA:
     def __init__(self, c2w, f0, plate, obs, X0, prior_sigma, device, focal_sigma=0.3, k_sigma=0.5,
-                 zoom=False, f_init=None, zoom_smooth=0.01, max_pairs_chunk=400_000):
+                 zoom=False, f_init=None, zoom_smooth=0.01, max_pairs_chunk=400_000, zoom_anchor="pi4"):
         from refine import _project
         self.dev = device
         self.T = c2w.shape[0]
@@ -37,6 +37,10 @@ class LMBA:
         self.nf = T if self.zoom else 1
         if self.zoom and f_init is not None:
             lf = np.log(np.asarray(f_init, np.float64) / self.f0)
+            if zoom_anchor == "flat":
+                # only the overall focal level is tied to Pi4 (it can miss a zoom entirely and read it as a
+                # dolly): the tracks + smoothness decide how the focal changes over the shot.
+                lf = np.full_like(lf, float(np.median(lf)))
         else:
             lf = np.zeros(self.nf)
         self.logf_prior = torch.tensor(lf, dtype=torch.float64, device=device)

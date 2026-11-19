@@ -248,6 +248,22 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
 - scipy's robust losses stall on this bundle adjustment; IRLS around a linear loss works. Thinning
   tracks took one solve from 20 min to 4 min.
 
+### Validation (hard-footage test, 2026-11-19)
+- **Reprojection error alone hides problems.** Use the three checks together:
+  - holdout tracks (`bench_ba.py --holdout 0.15`);
+  - the grid overlay and stick metric (`tools/overlay_check.py`);
+  - ground truth when available.
+- **Holdout error measures self-consistency, not correctness.** A wrong lens model predicts held-out tracks
+  just as well. Never use it to choose the model. The normal holdout/train ratio is about 1.2–1.6×.
+- **Statistical (Laplace) uncertainties from the bundle adjustment are useless here.** With about 40k
+  observations they are wildly over-confident (±0.08 % on a focal that can move 14 %).
+- **Zoom vs dolly, and focal vs distortion, are genuinely ambiguous on slow, low-parallax shots.** The tracks
+  cannot decide, so the user picks the setting (Lock Focal, distortion off, Zoom Lens).
+- **Phone handheld is the weakest case** (likely rolling shutter). A rolling-shutter model would be the next
+  solver feature.
+- **Overlay tool:** the ground plane must be *below* the camera (otherwise a tree canopy wins), and points
+  under Pi4's motion mask must be excluded (people drag the flow).
+
 ### Tooling
 - `np.load(npz)` is lazy: indexing it in a loop re-reads the file (110 s over the bind mount). Load
   each array once.
@@ -285,6 +301,7 @@ Most of the real bugs were caught this way.
   solved cameras would fix the set geometry there.
 - The robot is built from primitives. The next step in realism is a modelled, high-detail asset that
   keeps the same rig, lighting and composite.
+- Rolling-shutter model for phone footage (largest remaining error source on the hard-footage test).
 - Candidates: writing tracks into Blender's clip tracker, a metric-scale fix from a known measurement,
   a curved walk path (the robot button walks a straight line), and an "Insert Asset" button for any rigged
   character.

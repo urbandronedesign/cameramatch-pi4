@@ -115,6 +115,42 @@ from the solved projection.
 
 Checks: `blender -b <solved.blend> --python tests/check_robust_features.py -- [zoom_job first_png gt.json]`.
 
+## Hard-footage test (2026-11-19)
+Five shots, each targeting one weakness, solved with default settings (LM solver, 600 tracks):
+
+| Shot | Source | Weakness | Median / p90 | Holdout median (ratio) | Grid stick (median, drift/frame) |
+|---|---|---|---|---|---|
+| Venice alley (reference) | Mixkit 4600 | — | 0.35 / 0.92 px | 0.41 px (1.19×) | 1.1 px, 0.011 px |
+| Synthetic GT (reference) | gt_render | — | 0.36 / 1.16 px | 0.58 px (1.64×) | — |
+| ToS room | ToS 13543–13700 | apparent zoom, people moving | 0.19 / 0.65 px | 0.29 px (1.51×) | 10.7 px, 0.44 px (desk plane) |
+| ToS balcony | ToS 1778–1904 | low light, dark foreground | 0.36 / 1.10 px | 0.52 px (1.44×) | 3.3 px, 0.15 px |
+| Japan street | Mixkit 4437 | handheld in a dense crowd | 0.39 / 1.13 px | 0.60 px (1.52×) | ground hidden by people |
+| Students | Mixkit 4519 | people in front, slow push | 0.18 / 0.55 px | 0.22 px (1.24×) | 4.1 px, 0.054 px |
+| Park path (portrait) | Mixkit 40656 | handheld phone walk | **0.86 / 2.44 px** | **1.56 px (1.81×)** | 12.7 px, 0.16 px |
+
+*Holdout:* 15 % of the tracks are kept out of the solve, then triangulated from the solved cameras.
+*Grid stick:* a ground-plane grid's intersections tracked with KLT on the ground texture (moving objects
+masked) versus their projection (`tools/overlay_check.py`, which also writes an overlay video). This metric
+includes plane-fit error: a flat plane on a cluttered desk or a curved path is not the real surface.
+
+What it showed:
+- **Every shot solves.** Crowds, darkness and occluders are handled by Pi4's motion masks plus the robust
+  bundle adjustment.
+- **Handheld phone footage is the weak spot**: two to four times the error of the other shots, most likely from
+  rolling shutter and motion blur, which the camera model doesn't include.
+- **Zoom vs dolly is ambiguous on low-parallax shots.** On the ToS room, Pi4 sees no zoom, and both
+  interpretations reach exactly the same error. Even with the focal prior released (`zoom_anchor="flat"`), the
+  tracks choose a dolly with a 5 % zoom. The real optical zoom is proven only on synthetic footage.
+- **Focal and distortion trade off on slow push-ins.** On the students shot, with and without k1/k2 give the
+  same error but focals 14 % apart (2726 / 3115 px). Use *Lock Focal* / no distortion on such shots.
+- **Two diagnostics were tried and rejected, because they are not reliable:**
+  - The statistical (Laplace) focal uncertainty is far too optimistic (±0.08 % on the students shot).
+  - Choosing the lens model by holdout error picks *no distortion* on the synthetic GT, where it is wrong
+    (rotation error 2.6° instead of 0.23°). The holdout measures self-consistency, not correctness.
+
+Tools: `tools/motion_profile.py` (zoom / jitter / parallax profile of a clip, used to find the shots),
+`tools/overlay_check.py` (grid overlay + stick metric), `server/bench_ba.py --holdout 0.15`.
+
 ## Foreground matte refinement (MatAnyone 2)
 `tools/matte_pipeline.py` (on-demand `matte` image: SAM 2.1 Apache-2.0 + [MatAnyone 2](https://huggingface.co/PeiqingYang/MatAnyone2),
 NTU S-Lab License 1.0, non-commercial) turns π⁴'s coarse motion mask into a soft, edge-accurate alpha:

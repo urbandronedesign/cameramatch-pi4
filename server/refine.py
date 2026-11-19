@@ -288,17 +288,69 @@ class BA:
 
 
 # --------------------------------------------------------------------------- driver
+def _undistort(xd, yd, k1, k2, iters=20):
+    x, y = xd.copy(), yd.copy()
+    for _ in range(iters):
+        r2 = x * x + y * y
+        d = 1 + k1 * r2 + k2 * r2 * r2
+        x, y = xd / d, yd / d
+    return x, y
+
+
+def holdout_error(held, c2w, f_fr, k1, k2, cx, cy, min_obs=5):
+    """Triangulate each held-out track from the solved cameras alone (linear, undistorted rays) and return the
+    reprojection error statistics of its observations: a camera-only accuracy measure."""
+    fr = held[:, 0].astype(int)
+    tid = held[:, 1].astype(np.int64)
+    f = np.asarray(f_fr)[fr]
+    x, y = _undistort((held[:, 2] - cx) / f, (held[:, 3] - cy) / f, k1, k2)
+    w2c = np.linalg.inv(c2w)
+    errs, ntr = [], 0
+    order = np.argsort(tid, kind="stable")
+    tid_s = tid[order]
+    starts = np.r_[0, np.nonzero(np.diff(tid_s))[0] + 1]
+    ends = np.r_[starts[1:], len(tid_s)]
+    for a, b in zip(starts, ends):
+        if b - a < min_obs:
+            continue
+        ii = order[a:b]
+        Pm = w2c[fr[ii], :3, :]                                  # (m, 3, 4)
+        A = np.concatenate([x[ii, None] * Pm[:, 2] - Pm[:, 0], y[ii, None] * Pm[:, 2] - Pm[:, 1]])
+        X = np.linalg.svd(A)[2][-1]
+        if abs(X[3]) < 1e-12:
+            continue
+        X = X[:3] / X[3]
+        Xc = np.einsum("mij,j->mi", Pm[:, :, :3], X) + Pm[:, :, 3]
+        if np.any(Xc[:, 2] <= 0):
+            continue
+        xp, yp = Xc[:, 0] / Xc[:, 2], Xc[:, 1] / Xc[:, 2]
+        r2 = xp * xp + yp * yp
+        dd = 1 + k1 * r2 + k2 * r2 * r2
+        u = f[ii] * xp * dd + cx
+        v = f[ii] * yp * dd + cy
+        errs.append(np.hypot(u - held[ii, 2], v - held[ii, 3]))
+        ntr += 1
+    e = np.concatenate(errs) if errs else np.array([np.nan])
+    return dict(median=float(np.median(e)), p90=float(np.percentile(e, 90)), tracks=ntr, obs=int(len(e)))
+
+
 def _stats(e):
     return dict(median=float(np.median(e)), mean=float(np.mean(e)), p90=float(np.percentile(e, 90)),
                 rms=float(np.sqrt(np.mean(e ** 2))))
 
 
 def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nfev=50, quality=0.001,
-           focal_sigma=0.3, progress=None, solve_distortion=True, solver="lm", zoom=False, zoom_smooth=0.01):
+           focal_sigma=0.3, progress=None, solve_distortion=True, solver="lm", zoom=False, zoom_smooth=0.01,
+           zoom_anchor="pi4", holdout_frac=0.0):
     """result: dict from result.npz; cache: dict(depth [T,Hm,Wm] metric, dyn [T,Hm,Wm]).
     progress(stage, frac, msg) is called with stages 'klt' and 'ba'.
     solver: "lm" (GPU Levenberg-Marquardt + Schur complement, ba_lm.py) or "scipy" (TRF + LSMR, class BA).
-    zoom: one focal per frame (LM solver only), prior to Pi4's per-frame focal + smoothness zoom_smooth."""
+    zoom: one focal per frame (LM solver only), prior to Pi4's per-frame focal + smoothness zoom_smooth.
+    holdout_frac: keep that fraction of tracks out of the solve and report their error. This measures the
+    solve's self-consistency, NOT its correctness: on the synthetic GT a wrong lens model (no k1/k2, focal
+    17% off, 2.6 deg rotation error) predicts held-out tracks as well as the right one, so it cannot be used
+    to choose the lens model.
+    """
     prog = progress or (lambda *a, **k: None)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     c2w = result["c2w"].astype(np.float64)
@@ -364,79 +416,100 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
     log(f"[refine] init: {int(tri.sum())} triangulated, {int((~tri & good_pt).sum())} from Pi4 depth")
 
     med_depth = float(np.median(depth[depth > 0]))
-    obs_g = obs[good_pt[tid]]
-    k_sigma = 0.5 if solve_distortion else 1e-5
-    if solver == "lm":
-        from ba_lm import LMBA
-        f_init = np.asarray(result["fx"], np.float64).reshape(-1) * sx if zoom else None
-        ba = LMBA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
-                  focal_sigma=focal_sigma, k_sigma=k_sigma, zoom=zoom, f_init=f_init, zoom_smooth=zoom_smooth)
+    obs_all = obs[good_pt[tid]]
+
+    def run(obs_g, solve_dist, held=None, tag=""):
+        k_sigma = 0.5 if solve_dist else 1e-5
+        if solver == "lm":
+            from ba_lm import LMBA
+            f_init = np.asarray(result["fx"], np.float64).reshape(-1) * sx if zoom else None
+            ba = LMBA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
+                      focal_sigma=focal_sigma, k_sigma=k_sigma, zoom=zoom, f_init=f_init, zoom_smooth=zoom_smooth,
+                      zoom_anchor=zoom_anchor)
+        else:
+            if zoom:
+                log("[refine] zoom needs the LM solver: solving one constant focal")
+            ba = BA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
+                    focal_sigma=focal_sigma, k_sigma=k_sigma)
+        x = ba.x0.copy()
+        e_init = ba.obs_errors(x)
+        log(f"[refine]{tag} init reprojection: median {np.median(e_init):.2f}px p90 {np.percentile(e_init, 90):.1f}px")
+        # Gross-outlier pre-filter (points behind cameras, bad depth init, KLT drift).
+        thr0 = max(0.03 * max(W, H), 5 * float(np.median(e_init)))
+        ok0 = np.isfinite(e_init) & (e_init < thr0)
+        obs_g = obs_g[ok0]
+        ba.set_obs(obs_g)
+
+        # Stage 1: heavy-tailed loss to pull everything in. Stage 2: reject, Huber.
+        def it_cb(stage_i, label):
+            return lambda i, n, med: prog("ba", (stage_i * n + i) / (2 * n),
+                                          f"bundle adjustment{tag} {label} {i + 1}/{n}, median error {med:.2f}px")
+
+        x = ba.solve(x, max_nfev, log, loss="cauchy", f_scale=3.0, on_iter=it_cb(0, "robust pass"))
+        e1 = ba.obs_errors(x)
+        thr = max(2.0, 3 * float(np.median(e1)))
+        kept_obs = obs_g[e1 < thr]
+        ba.set_obs(kept_obs)
+        log(f"[refine]{tag} outlier rejection > {thr:.2f}px: kept {len(kept_obs)}/{len(obs_g)} observations")
+        x = ba.solve(x, max_nfev, log, loss="huber", f_scale=1.0, on_iter=it_cb(1, "final pass"))
+        e2 = ba.obs_errors(x)
+
+        _, w, C, X, _ = ba.unpack(x)
+        R = (_expmap(w) @ ba.R0).cpu().numpy()  # world->cam
+        c2w_ref = np.tile(np.eye(4), (T, 1, 1))
+        c2w_ref[:, :3, :3] = np.transpose(R, (0, 2, 1))
+        c2w_ref[:, :3, 3] = C.cpu().numpy()
+        f_fr = ba.f_frames(x)
+        f = float(np.median(f_fr))
+        k1, k2 = ba.k12(x)
+
+        # Per-frame median error and the points that survived (>= 2 inlier observations).
+        kf = kept_obs[:, 0].astype(int)
+        per_frame = np.array([np.median(e2[kf == i]) if (kf == i).any() else np.nan for i in range(T)])
+        kt = kept_obs[:, 1].astype(int)
+        support = np.bincount(kt, minlength=len(colors))
+        pts_ok = support >= 2
+        # Inlier observations of the kept points (frame position, index into track_points, u, v) so later
+        # tools know which points each frame actually saw.
+        new_id = -np.ones(len(colors), np.int64)
+        new_id[pts_ok] = np.arange(int(pts_ok.sum()))
+        tob = kept_obs[pts_ok[kt]].copy()
+        tob[:, 1] = new_id[tob[:, 1].astype(np.int64)]
+        full = obs_full[pts_ok[obs_full[:, 1].astype(np.int64)]].copy()
+        full[:, 1] = new_id[full[:, 1].astype(np.int64)]
+        out = dict(
+            track_obs=tob.astype(np.float32), track_obs_full=full.astype(np.float32),
+            refined=np.array(True), c2w_refined=c2w_ref, f_px=np.array(f), k1=np.array(k1), k2=np.array(k2),
+            plate_size=np.array([W, H]), principal_px=np.array([cx, cy]),
+            track_points=X.cpu().numpy()[pts_ok].astype(np.float32), track_colors=colors[pts_ok],
+            reproj_per_frame_px=per_frame.astype(np.float32),
+            f_px_frames=f_fr.astype(np.float64), zoom=np.array(bool(zoom and solver == "lm")),
+        )
+        stats = dict(init=_stats(e_init[ok0]), round1=_stats(e1), final=_stats(e2), outlier_thresh_px=thr,
+                     prefilter_thresh_px=thr0, prefilter_kept=float(ok0.mean()),
+                     tracks=int(pts_ok.sum()), observations=int(len(kept_obs)), plate=[W, H],
+                     f_px=f, f_px_pi4=f0, k1=k1, k2=k2, solver=solver, distortion=bool(solve_dist),
+                     f_px_range=[float(f_fr.min()), float(f_fr.max())])
+        if held is not None and len(held):
+            stats["holdout"] = holdout_error(held, c2w_ref, f_fr, k1, k2, cx, cy)
+            log(f"[refine]{tag} HOLDOUT (tracks never seen by the solve): median "
+                f"{stats['holdout']['median']:.3f}px, p90 {stats['holdout']['p90']:.3f}px over "
+                f"{stats['holdout']['tracks']} tracks")
+        log(f"[refine]{tag} final reprojection: median {stats['final']['median']:.3f}px, p90 "
+            f"{stats['final']['p90']:.3f}px, f {f0:.1f}->{f:.1f}px, k1 {k1:.4f}, k2 {k2:.4f}")
+        return out, stats
+
+    split = None
+    if holdout_frac > 0:
+        rng = np.random.default_rng(12345)
+        tids = np.unique(obs_all[:, 1].astype(np.int64))
+        hid = rng.choice(tids, max(1, int(len(tids) * holdout_frac)), replace=False)
+        hm = np.isin(obs_all[:, 1].astype(np.int64), hid)
+        split = (obs_all[~hm], obs_full[np.isin(obs_full[:, 1].astype(np.int64), hid)])
+        log(f"[refine] holdout: {len(hid)} tracks kept out of the solve")
+        out, stats = run(split[0], solve_distortion, split[1])
     else:
-        if zoom:
-            log("[refine] zoom needs the LM solver: solving one constant focal")
-        ba = BA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
-                focal_sigma=focal_sigma, k_sigma=k_sigma)
-    x = ba.x0.copy()
-    e_init = ba.obs_errors(x)
-    log(f"[refine] init reprojection: median {np.median(e_init):.2f}px p90 {np.percentile(e_init, 90):.1f}px")
-
-    # Gross-outlier pre-filter (points behind cameras, bad depth init, KLT drift).
-    thr0 = max(0.03 * max(W, H), 5 * float(np.median(e_init)))
-    ok0 = np.isfinite(e_init) & (e_init < thr0)
-    obs_g = obs_g[ok0]
-    ba.set_obs(obs_g)
-    # Stage 1: heavy-tailed loss to pull everything in. Stage 2: reject, Huber.
-    def it_cb(stage_i, label):
-        return lambda i, n, med: prog("ba", (stage_i * n + i) / (2 * n),
-                                      f"bundle adjustment {label} {i + 1}/{n}, median error {med:.2f}px")
-
-    x = ba.solve(x, max_nfev, log, loss="cauchy", f_scale=3.0, on_iter=it_cb(0, "robust pass"))
-    e1 = ba.obs_errors(x)
-    thr = max(2.0, 3 * float(np.median(e1)))
-    kept_obs = obs_g[e1 < thr]
-    ba.set_obs(kept_obs)
-    log(f"[refine] outlier rejection > {thr:.2f}px: kept {len(kept_obs)}/{len(obs_g)} observations")
-    x = ba.solve(x, max_nfev, log, loss="huber", f_scale=1.0, on_iter=it_cb(1, "final pass"))
+        out, stats = run(obs_all, solve_distortion)
     prog("ba", 1.0, "bundle adjustment done")
-    e2 = ba.obs_errors(x)
-
-    _, w, C, X, _ = ba.unpack(x)
-    R = (_expmap(w) @ ba.R0).cpu().numpy()  # world->cam
-    c2w_ref = np.tile(np.eye(4), (T, 1, 1))
-    c2w_ref[:, :3, :3] = np.transpose(R, (0, 2, 1))
-    c2w_ref[:, :3, 3] = C.cpu().numpy()
-    f_fr = ba.f_frames(x)
-    f = float(np.median(f_fr))
-    k1, k2 = ba.k12(x)
-
-    # Per-frame median error and the points that survived (â‰¥2 inlier observations).
-    kf = kept_obs[:, 0].astype(int)
-    per_frame = np.array([np.median(e2[kf == i]) if (kf == i).any() else np.nan for i in range(T)])
-    kt = kept_obs[:, 1].astype(int)
-    support = np.bincount(kt, minlength=len(colors))
-    pts_ok = support >= 2
-    # Inlier observations of the kept points (frame position, index into track_points, u, v) so later
-    # tools know which points each frame actually saw.
-    new_id = -np.ones(len(colors), np.int64)
-    new_id[pts_ok] = np.arange(int(pts_ok.sum()))
-    tob = kept_obs[pts_ok[kt]].copy()
-    tob[:, 1] = new_id[tob[:, 1].astype(np.int64)]
-    full = obs_full[pts_ok[obs_full[:, 1].astype(np.int64)]].copy()
-    full[:, 1] = new_id[full[:, 1].astype(np.int64)]
-    out = dict(
-        track_obs=tob.astype(np.float32), track_obs_full=full.astype(np.float32),
-        refined=np.array(True), c2w_refined=c2w_ref, f_px=np.array(f), k1=np.array(k1), k2=np.array(k2),
-        plate_size=np.array([W, H]), principal_px=np.array([cx, cy]),
-        track_points=X.cpu().numpy()[pts_ok].astype(np.float32), track_colors=colors[pts_ok],
-        reproj_per_frame_px=per_frame.astype(np.float32),
-        f_px_frames=f_fr.astype(np.float64), zoom=np.array(bool(zoom and solver == "lm")),
-    )
-    stats = dict(init=_stats(e_init[ok0]), round1=_stats(e1), final=_stats(e2), outlier_thresh_px=thr,
-                 prefilter_thresh_px=thr0, prefilter_kept=float(ok0.mean()),
-                 tracks=int(pts_ok.sum()), observations=int(len(kept_obs)), plate=[W, H],
-                 f_px=f, f_px_pi4=f0, k1=k1, k2=k2, solver=solver,
-                 f_px_range=[float(f_fr.min()), float(f_fr.max())])
-    log(f"[refine] final reprojection: median {stats['final']['median']:.3f}px, p90 {stats['final']['p90']:.3f}px, "
-        f"f {f0:.1f}->{f:.1f}px, k1 {k1:.4f}, k2 {k2:.4f}")
     return out, stats
 
