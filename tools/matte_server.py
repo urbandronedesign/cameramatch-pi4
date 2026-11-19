@@ -9,6 +9,8 @@ POST /set    {"job": str, "tris": 60000, "voxel": 0.04, "rebuild": false}
 POST /check  {"job": str}
      -> overlay check (overlay_check.py): ground grid drawn with the solved camera into every frame,
         check/overlay.mp4 + check/sheet.jpg and the KLT "stick" metric (grid vs. ground texture, px).
+POST /maps   {"job": str, "first": 1, "scale": 1.0, "plate": true, "masks": true, "depth": true}
+     -> export_maps.py: plate / masks / depth sequences at plate resolution in /work/<job>/export_maps.
 POST /comp   {"job": str, "render_dir": "render", "out_dir": "comp", "soft": 0.6, "wrap": 0.25, "grain": "auto"}
      -> plate x shadow-catcher pass + matched CG (comp_plate.py), comp_####.png + <clip>_comp.mp4 + plate_vs_comp.mp4.
 MatAnyone 2: NTU S-Lab License 1.0 (non-commercial). SAM 2.1: Apache-2.0.
@@ -131,6 +133,16 @@ def _do_check(name, req):
     return dict(video="check/overlay.mp4", sheet="check/sheet.jpg", metrics=rep)
 
 
+def _do_maps(name, req):
+    job = _job_dir(name)
+    log = lambda s: PROGRESS.log(name, s)  # noqa: E731
+    out = os.path.join(job, "export_maps")
+    args = [job, out, "--first", str(int(req.get("first", 1))), "--scale", str(float(req.get("scale", 1.0)))]
+    args += [f"--{k}" for k in ("plate", "masks", "depth") if req.get(k)]
+    rep = _run_tool("export_maps.py", args, "maps", log, name) or {}
+    return dict(out="export_maps", summary=rep)
+
+
 def _do_comp(name, req):
     job = _job_dir(name)
     log = lambda s: PROGRESS.log(name, s)  # noqa: E731
@@ -187,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
                              torch=torch.__version__))
 
     def do_POST(self):
-        if self.path in ("/set", "/comp", "/check"):
+        if self.path in ("/set", "/comp", "/check", "/maps"):
             return self._post_job(self.path[1:])
         if self.path != "/matte":
             return self._send(404, {"error": "not found"})
@@ -228,11 +240,11 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             name = req.get("job", "")
             stages = {"set": [("mesh", 70), ("envmap", 30)], "comp": [("comp", 85), ("encode", 15)],
-                      "check": [("check", 100)]}[kind]
+                      "check": [("check", 100)], "maps": [("maps", 100)]}[kind]
             PROGRESS.start(name, stages)
             t0 = time.time()
             with _lock:
-                out = {"set": _do_set, "comp": _do_comp, "check": _do_check}[kind](name, req)
+                out = {"set": _do_set, "comp": _do_comp, "check": _do_check, "maps": _do_maps}[kind](name, req)
             PROGRESS.finish(name, ok=True)
             self._send(200, dict(ok=True, seconds=round(time.time() - t0, 1), **out))
         except Cancelled:

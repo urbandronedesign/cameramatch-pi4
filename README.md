@@ -140,6 +140,65 @@ Advanced settings: *Refine at Plate Resolution* (default on), *Active Tracks* (6
 - Video decoded with OpenCV (H.264/H.265/MJPEG fine; ProRes may not be). TIFF/EXR sequences unsupported.
 - Upstream π⁴ is very new (released 2026-11-17); pinned to commit `32dfbea`.
 
+## Export to other software (v0.13.0)
+**Export Camera + Scene** (guided panel, below the steps, once a shot is solved) writes into one folder
+(default `<job>/export`):
+
+| File | Holds | Open it in |
+|---|---|---|
+| `<clip>.abc` | animated camera (transform + focal), set meshes, track points, locators (+ CG) | Maya, Houdini, Nuke, C4D, Unreal |
+| `<clip>.fbx` | the same, Y up / −Z forward, a key on every frame | Maya, 3ds Max, Unreal, Unity |
+| `<clip>.usdc` | the same, Y up | Houdini Solaris, Omniverse, Unreal, Maya |
+| `<clip>.nk` | Nuke Camera3 (animated), plate Read, undistort / redistort STMaps, ReadGeo of the Alembic | Nuke |
+| `stmap_undistort.exr`, `stmap_redistort.exr` | 32-bit ST maps of the solved lens distortion (Nuke convention) | any compositor |
+| `camera.json`, `camera.csv` | per-frame matrices (Z up and Y up), focal, sensor, k1/k2 with the formula, rolling shutter | pipelines, scripts |
+
+**Plate, masks and depth** (options, on by default; built by the matte server, numbered like the scene, at
+plate resolution, following the plate's lens):
+- `plate/plate_####.png`: the footage, every frame of the solved range.
+- `masks/moving_####.png` (Pi4, soft), `masks/trees_water_sky_####.png` (semantic, now saved by every solve),
+  `masks/matte_####.png` (MatAnyone 2, after Refine Matte), `masks/ignore_####.png` (your Ignore Mask).
+- `depth/depth_####.exr`: 32-bit float channel `Z`, scene units, distance along the optical axis. Pi4's depth is
+  scaled by one factor so it agrees with the solve (median over the inlier track observations). A per-frame
+  factor was tried and rejected: frames see different track subsets and the ratio follows the subset.
+- The Nuke script gets a Read node per sequence; `README.txt` in the folder explains every file.
+
+| Shot | Depth factor | Depth vs solved track points (median per point) | Notes |
+|---|---|---|---|
+| Venice (guided test) | ×1.023 | 4.2 %; ratio 0.996–1.017 on every sampled frame | 120 frames in 51 s |
+| Venice, re-solved without rolling shutter | ×0.971 | 3.9 % | + trees / water / sky masks |
+| Tears of Steel bridge | ×1.009 | **27 %** | the export warns: depth for rough work only; + matte |
+
+Pi4's moving mask is a soft probability: on the Venice shot (nothing moves) 5 % of each frame is above 0.5,
+on a wall in shadow. The solve ignores those areas anyway; for roto use the matte.
+
+Options: formats, set geometry, track points, number of locators (empties at the most-observed tracks, default
+150), CG characters (baked as animated meshes in Alembic / USD, so the files get large; skeletons in FBX).
+Units are metres, and the camera looks down its local −Z with +Y up.
+
+Notes for the other application:
+- Set the scene to the shot's frame rate before importing (it is in `camera.json`); Alembic is time-based.
+- Lens distortion is not part of Alembic / FBX / USD cameras: undistort the plate with `stmap_undistort.exr`,
+  match-move on it, and put the CG renders through `stmap_redistort.exr`. For a zoom shot the maps use the
+  median focal.
+- Blender's own FBX importer shifts animation by 1 frame by default: set *Animation Offset* to 0.
+- Rolling shutter is in `camera.json` only.
+
+Test (`tests/check_export.py`, Venice guided-test scene with set, tracks, locators and two animated CG
+characters; plus the same camera with an animated zoom 30 → 45 mm):
+
+| Check | Result |
+|---|---|
+| Alembic / FBX / USD re-imported: camera reprojection of 400 track points vs the original | max 0.0003 / 0.0007 / 0.0006 px |
+| Zoom kept (focal per frame) | exact in all three |
+| `camera.json` + distortion alone vs the tracked 2D positions | 0.318 px median (solve: 0.280 px on its inliers) |
+| Through `stmap_undistort.exr` | 0.318 px median |
+| Nuke camera rebuilt from the `.nk` curves (Y up, rot_order XYZ) | max 0.002 px |
+| CG characters animated after import (Alembic / USD / FBX) | 34 of 37 meshes move, the 3 static set meshes stay |
+
+The `.nk` was checked by rebuilding the camera from its own curves under Nuke's conventions, not inside Nuke
+(not installed here).
+
 ## Mixamo characters + engine start with Docker closed (v0.12.1)
 Tested with Mixamo rigs (`mixamorig:` bones, armature scale 0.01): three.js' Mixamo exports (`mixamo.fbx`,
 `Xbot.glb`, `Soldier.glb`) and two Mixamo-style FBX walks made from Xbot (`tests/make_mixamo_fbx.py`: In Place,
@@ -510,6 +569,8 @@ Solve: *Solve Lens Distortion* off, *Lock Focal to Pi4* on -> 0.35 px median, f 
 blender --python tests/gui_guided.py -- <footage.mp4> <character.glb> <out_dir> [max_frames]  # whole guided flow, real UI
 blender -b <scene with set + CM_path>.blend --python tests/check_offfloor.py      # paths drawn into walls
 blender -b <scene with CM_Set>.blend --python tests/check_mixamo.py -- <char.fbx|glb> <out> [not_walk]
+blender -b <solved scene>.blend --python tests/check_export.py -- auto <out>       # export round trip (abc/fbx/usd/nk/stmap/json)
+blender <solved scene>.blend --python tests/gui_export.py -- <out>       # Export button in the real UI (plate / masks / depth)
 blender --python tests/gui_engine_down.py -- <footage.mp4> <out>   # quit Docker Desktop first
 blender -b --factory-startup --python tests/blender_smoke.py                    # import/axes, no server
 blender -b --factory-startup --python tests/blender_e2e.py -- <video|first_png>  # full chain

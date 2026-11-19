@@ -22,7 +22,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, Po
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Vector
 
-from . import characters, collide, engine, guide, ignore_mask, paths, robot, set_builder
+from . import characters, collide, engine, export, guide, ignore_mask, paths, robot, set_builder
 
 # The work folder is the repo's ./work, mounted as /work by docker-compose. Set it in the add-on preferences,
 # or with the CAMERAMATCH_WORK environment variable.
@@ -38,7 +38,7 @@ _STAGE_LABELS = {
     "matanyone": "MatAnyone 2", "fuse": "Fusing mattes", "export": "Exporting mattes", "done": "Done",
     "error": "Failed", "mesh": "Set mesh (Poisson)", "envmap": "Plate environment", "set": "Building set in Blender",
     "render": "Rendering (Cycles)", "comp": "Compositing", "encode": "Encoding video",
-    "check": "Overlay check", "download": "Downloading",
+    "check": "Overlay check", "download": "Downloading", "maps": "Plate, masks, depth",
 }
 SAMPLE_CLIP_URL = "https://assets.mixkit.co/videos/4600/4600-1080.mp4"      # Mixkit free license
 SAMPLE_CHAR_URL = ("https://github.com/mrdoob/three.js/raw/r170/examples/models/gltf/RobotExpressive/"
@@ -1899,6 +1899,138 @@ class CAMERAMATCH_OT_walk_to_cursor(bpy.types.Operator):
             return bpy.ops.cameramatch.move_along_path()
 
 
+# --------------------------------------------------------------------------- export to other software
+class CAMERAMATCH_OT_export_scene(bpy.types.Operator):
+    bl_idname = "cameramatch.export_scene"
+    bl_label = "Export Camera + Scene"
+    bl_description = ("Export the solved camera, set geometry and track points for other software: Alembic, FBX, "
+                      "USD, a Nuke script, lens-distortion ST maps and camera.json / .csv")
+
+    directory: StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE"})
+    use_abc: BoolProperty(name="Alembic (.abc)", default=True, description="Maya, Houdini, Nuke, C4D, Unreal")
+    use_fbx: BoolProperty(name="FBX", default=True, description="Maya, 3ds Max, Unreal, Unity")
+    use_usd: BoolProperty(name="USD (.usdc)", default=True, description="Houdini Solaris, Omniverse, Unreal, Maya")
+    use_nk: BoolProperty(name="Nuke script (.nk)", default=True,
+                         description="Camera3, plate, undistort / redistort STMaps, ReadGeo of the Alembic")
+    use_stmap: BoolProperty(name="Lens ST maps (EXR)", default=True,
+                            description="Exact undistort / redistort maps for the solved distortion (any compositor)")
+    use_json: BoolProperty(name="camera.json / .csv", default=True,
+                           description="Per-frame matrices, focal, sensor, distortion, rolling shutter")
+    include_set: BoolProperty(name="Set Geometry", default=True, description="Floor and walls (Build Set)")
+    include_tracks: BoolProperty(name="Track Points", default=True, description="The solved 3D track points")
+    n_locators: IntProperty(name="Locators", default=150, min=0, max=5000,
+                            description="Empties at the most observed track points (0: none)")
+    include_cg: BoolProperty(name="CG Characters", default=False,
+                             description="Also export the characters / robots you added (animated)")
+    use_plate: BoolProperty(name="Plate (PNG sequence)", default=True,
+                            description="The footage as plate/plate_####.png (about 2 MB a frame at 1080p)")
+    use_masks: BoolProperty(name="Masks", default=True,
+                            description="Moving objects, trees / water / sky, matte and Ignore Mask as PNG sequences")
+    use_depth: BoolProperty(name="Depth (EXR)", default=True,
+                            description="Z-depth per frame, 32-bit EXR in scene units (about 5 MB a frame at 1080p)")
+
+    _timer = None
+    _thread = None
+
+    @classmethod
+    def poll(cls, context):
+        return _job_ok(context) and context.scene.camera is not None
+
+    def invoke(self, context, event):
+        if not self.directory:
+            self.directory = os.path.join(context.scene.cameramatch.last_job, "export") + os.sep
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def draw(self, context):
+        col = self.layout.column(heading="Formats")
+        for p in ("use_abc", "use_fbx", "use_usd", "use_nk", "use_stmap", "use_json"):
+            col.prop(self, p)
+        col = self.layout.column(heading="Images")
+        col.prop(self, "use_plate")
+        col.prop(self, "use_masks")
+        col.prop(self, "use_depth")
+        col = self.layout.column(heading="Include")
+        col.prop(self, "include_set")
+        col.prop(self, "include_tracks")
+        col.prop(self, "n_locators")
+        col.prop(self, "include_cg")
+
+    def execute(self, context):
+        s = context.scene.cameramatch
+        fm = [f for f, on in (("abc", self.use_abc), ("fbx", self.use_fbx), ("usd", self.use_usd),
+                              ("nk", self.use_nk), ("stmap", self.use_stmap), ("json", self.use_json)) if on]
+        out = bpy.path.abspath(self.directory or os.path.join(s.last_job, "export"))
+        d = np.load(os.path.join(s.last_job, "result.npz"))
+        clip = _main_clip(context)
+        stats = guide.load_stats(s.last_job) or {}
+        meta = dict(result={k: float(d[k]) for k in ("k1", "k2") if k in d},
+                    track_obs=d["track_obs_full"] if "track_obs_full" in d else None,
+                    plate=bpy.path.abspath(clip.filepath) if clip else "",
+                    generator="CameraMatch Pi4 " + ".".join(str(v) for v in _version()),
+                    solve=dict(median_px=stats.get("final", {}).get("median"), p90_px=stats.get("final", {}).get("p90"),
+                               job=os.path.basename(os.path.normpath(s.last_job))))
+        name = re.sub(r"[^\w.-]", "_", os.path.splitext(clip.name)[0] if clip else "cameramatch")
+        try:
+            w = export.export_scene(context, out, name, fm, self.include_set, self.include_tracks, self.n_locators,
+                                    self.include_cg, log=_log, meta=meta)
+        except Exception as e:
+            _log(f"Export failed: {e}")
+            self.report({"ERROR"}, f"Export failed: {e}")
+            return {"CANCELLED"}
+        _sync_log_text()
+        self.out, self.name_ = out, name
+        self.plate = meta["plate"]
+        if not (self.use_plate or self.use_masks or self.use_depth):
+            self.report({"INFO"}, f"Exported {len(w)} files to {out}")
+            return {"FINISHED"}
+        if _engine_down("Export"):
+            self.report({"WARNING"}, f"Exported {len(w)} files to {out}; plate / masks / depth need the engine "
+                                     "(Start Engine, then export again)")
+            return {"FINISHED"}
+        sc = context.scene
+        clip_ = _main_clip(context)
+        payload = dict(job=os.path.basename(os.path.normpath(s.last_job)), first=clip_.frame_start if clip_ else 1,
+                       scale=float(sc.get("cm_applied_scale", 1.0)), plate=self.use_plate, masks=self.use_masks,
+                       depth=self.use_depth)
+        self.job_dir = s.last_job
+        return _http_job(self, context, _prefs().matte_server_url.rstrip("/") + "/maps", payload, "Export",
+                         "maps", self._maps_done)
+
+    def _maps_done(self, context, r):
+        src = os.path.join(self.job_dir, r.get("out", "export_maps"))
+        same = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(self.out))
+        n = 0
+        for sub in ("plate", "masks", "depth"):
+            a, b = os.path.join(src, sub), os.path.join(self.out, sub)
+            if not os.path.isdir(a) or same:
+                continue
+            if os.path.isdir(b):
+                shutil.rmtree(b)
+            shutil.move(a, b)                         # same drive: a rename; otherwise a copy
+            n += len(os.listdir(b))
+        seqs = export.sequences(self.out)
+        export.finish_nuke(self.out, self.name_, context.scene, plate=self.plate, seqs=seqs)
+        st = (r.get("summary") or {}).get("depth_alignment")
+        dep = (f", depth x{st['factor']:.3f} to match the solve ({st['point_error_pct']:.1f}% per point)"
+               if st else "")
+        if st and st["point_error_pct"] > 15:
+            dep += ". Warning: the model's depth disagrees with the solve on this shot: use it for rough work only"
+        return f"Exported to {self.out}: " + ", ".join(sorted(seqs)) + dep
+
+    def modal(self, context, event):
+        return _http_job_modal(self, context, event)
+
+
+def _version():
+    try:
+        import tomllib
+        with open(os.path.join(os.path.dirname(__file__), "blender_manifest.toml"), "rb") as fh:
+            return tuple(int(v) for v in tomllib.load(fh)["version"].split("."))
+    except Exception:
+        return (0, 0, 0)
+
+
 # --------------------------------------------------------------------------- learning
 class CAMERAMATCH_OT_open_docs(bpy.types.Operator):
     bl_idname = "cameramatch.open_docs"
@@ -2119,6 +2251,10 @@ def draw_guided(layout, context):
             row.operator("cameramatch.render_comp", text="Final Render", icon="RENDER_ANIMATION").preview = False
             if done:
                 col.label(text=summ[:nc])
+    if _job_ok(context):
+        box = layout.box()
+        box.label(text="Export to Other Software", icon="EXPORT")
+        box.operator("cameramatch.export_scene", text="Export Camera + Scene", icon="EXPORT")
     row = layout.row(align=True)
     row.prop(s, "show_done", text="Show All", toggle=True, icon="HIDE_OFF")
     row.operator("cameramatch.open_docs", icon="HELP")
@@ -2244,7 +2380,8 @@ classes = (CAMERAMATCH_Prefs, CAMERAMATCH_Settings, CAMERAMATCH_OT_check_server,
            CAMERAMATCH_OT_start_engine, CAMERAMATCH_OT_stop_engine, CAMERAMATCH_OT_cancel,
            CAMERAMATCH_OT_load_footage, CAMERAMATCH_OT_show_footage, CAMERAMATCH_OT_check_overlay,
            CAMERAMATCH_OT_apply_fix, CAMERAMATCH_OT_add_character, CAMERAMATCH_OT_new_path,
-           CAMERAMATCH_OT_walk_to_cursor, CAMERAMATCH_OT_open_docs, CAMERAMATCH_OT_download_sample, *PANELS)
+           CAMERAMATCH_OT_walk_to_cursor, CAMERAMATCH_OT_open_docs, CAMERAMATCH_OT_download_sample,
+           CAMERAMATCH_OT_export_scene, *PANELS)
 
 
 def _statusbar_progress(self, context):

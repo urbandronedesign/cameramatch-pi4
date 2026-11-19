@@ -56,6 +56,10 @@ matte (tools)        on demand        docker compose --profile tools run --rm ma
 | `work/` | Job folders (`<clip>_<date>_<time>/`) and per-shot outputs |
 | `samples/` | Source clips. The full Tears of Steel film is in `samples/tos/` |
 
+**Export (v0.13.0):** `export.py`: Alembic / FBX / USD through Blender's exporters (selection = camera, track
+mesh, temporary locator empties, `CM_Set` meshes, optional CG), plus a Nuke script, ST maps and camera.json/.csv
+written directly. `tests/check_export.py` round-trips every format.
+
 **Ease of use (v0.12.0):** `engine.py` (background health poller, Start/Stop Engine through `docker compose`,
 starting Docker Desktop if needed), `guide.py` (footage presets, the solve grade and its suggestions, plain-language
 errors). The servers gained `GET /cancel?job=` (both), `POST /check` (matte server, runs `overlay_check.py`),
@@ -350,6 +354,16 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
   rigs are in quaternion mode, and a 90° axis tilt was silently lost). Importers leave one active NLA track per
   animation and may key the armature object itself: Add Character clears both. Root-motion walks get an
   in-place copy; non-walks are refused. Mixamo needs an Adobe login, so the tests use three.js' Mixamo exports.
+- Export (v0.13.0): Blender's FBX importer offsets animation by 1 frame (`anim_offset=1` default), which looks
+  like a 0.75 px camera error on a slow dolly; other applications read FBX keys at their true frames. Blender
+  5.3's USD armature writer hits "Code marked as unreachable" on these rigs, so characters go to USD as baked
+  meshes. Compare exports by reprojection in pixels, not by matrices. A scene whose track mesh no longer matches
+  `result.npz` (re-solved, not re-imported) is flagged on export.
+- Exported depth: compare it with the solve at the OBSERVED pixels (lens distortion moves points tens of pixels
+  at the edges; a pinhole projection samples the wrong depth). Pi4 depth vs solve: 4 % per point on Venice,
+  27 % on the ToS bridge. One global factor; per-frame factors chase the track subset (the frames with ~500
+  observations gave 1.02, the ~100-observation frames 1.07). Semantic masks are now saved by refine
+  (`<job>/semantic/sem_#####.png`) so the export can ship them.
 - Never block Blender's UI on HTTP: the engine light is fed by a background thread, and a 1 s app timer only
   redraws when the state text changes.
 

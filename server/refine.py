@@ -395,6 +395,11 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
         sem, frac = semantic.masks(src, result["frame_indices"], (Wm, Hm), classes=tuple(ignore_classes), log=log,
                                    progress=lambda fr, msg: prog("klt", 0.1 * fr, msg))
         dyn = np.maximum(dyn, sem.astype(np.float32))
+        if job_dir:                                  # keep them: the export ships them as masks
+            sd = os.path.join(job_dir, "semantic")
+            os.makedirs(sd, exist_ok=True)
+            for k, fi in enumerate(result["frame_indices"]):
+                cv2.imwrite(os.path.join(sd, f"sem_{int(fi) + 1:05d}.png"), (sem[k] > 0).astype(np.uint8) * 255)
         sem_info = dict(masked_pct=float(100 * sem.mean()), classes={k: round(100 * v, 1) for k, v in frac.items()})
         if sem.mean() > 0.5:
             log(f"[refine] {100 * sem.mean():.0f}% of the image is masked: the remaining tracks are concentrated, "
