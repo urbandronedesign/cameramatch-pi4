@@ -21,7 +21,7 @@ cm.register()
 for o in list(bpy.data.objects):  # factory startup cube/light/camera would sit on the solved path
     bpy.data.objects.remove(o)
 clip = bpy.data.movieclips.load(video)
-work = cm._DEFAULT_WORK
+work = os.environ.get("CAMERAMATCH_WORK") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work")
 job = "e2e_" + time.strftime("%Y%m%d_%H%M%S")
 job_dir = os.path.join(work, job)
 os.makedirs(job_dir)

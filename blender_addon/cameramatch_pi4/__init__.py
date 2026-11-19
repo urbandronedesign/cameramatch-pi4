@@ -23,7 +23,9 @@ from mathutils import Matrix
 
 from . import robot, set_builder
 
-_DEFAULT_WORK = r"E:\zaki\cameramatch_blender\work"  # must match docker-compose ./work mount
+# The work folder is the repo's ./work, mounted as /work by docker-compose. Set it in the add-on preferences,
+# or with the CAMERAMATCH_WORK environment variable.
+_WORK_ENV = "CAMERAMATCH_WORK"
 # Shared between the UI (main thread) and worker/poller threads. Only plain values are written from threads.
 _STATUS = {"text": "", "running": False, "pct": 0.0, "stage": "", "op": "", "t0": 0.0, "t_end": 0.0,
            "log": [], "synced": 0}
@@ -127,14 +129,18 @@ class CAMERAMATCH_Prefs(bpy.types.AddonPreferences):
     matte_server_url: StringProperty(name="Matte Server URL", default="http://127.0.0.1:8766",
                                      description="SAM 2.1 + MatAnyone 2 server (docker compose service matte-server)")
     work_dir: StringProperty(
-        name="Work folder", subtype="DIR_PATH", default=_DEFAULT_WORK,
-        description="Host folder mounted as /work in the Pi4 container (docker-compose ./work)",
+        name="Work folder", subtype="DIR_PATH", default="",
+        description="Your clone's work/ folder: the host folder docker-compose mounts as /work "
+                    "(empty: use the CAMERAMATCH_WORK environment variable)",
     )
 
     def draw(self, context):
         self.layout.prop(self, "server_url")
         self.layout.prop(self, "matte_server_url")
         self.layout.prop(self, "work_dir")
+        if not _work_dir():
+            self.layout.label(text="Set the Work folder to <your clone>/work (docker-compose mounts it as /work)",
+                              icon="ERROR")
 
 
 class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
@@ -187,6 +193,12 @@ class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
 
 def _prefs():
     return bpy.context.preferences.addons[__package__].preferences
+
+
+def _work_dir():
+    """Work folder from the preferences, else $CAMERAMATCH_WORK, else '' (not configured)."""
+    w = _prefs().work_dir.strip() or os.environ.get(_WORK_ENV, "").strip()
+    return bpy.path.abspath(w) if w else ""
 
 
 # --------------------------------------------------------------------------- server I/O
@@ -446,9 +458,13 @@ class CAMERAMATCH_OT_solve(bpy.types.Operator):
         clip = context.edit_movieclip
         prefs = _prefs()
         s = context.scene.cameramatch
-        work = bpy.path.abspath(prefs.work_dir)
+        work = _work_dir()
+        if not work:
+            self.report({"ERROR"}, "Work folder not set: Edit > Preferences > Add-ons > CameraMatch Pi4 > "
+                                   "Work folder = <your clone>/work")
+            return {"CANCELLED"}
         if not os.path.isdir(work):
-            self.report({"ERROR"}, f"Work folder not found: {work} (set it in add-on preferences)")
+            self.report({"ERROR"}, f"Work folder not found: {work} (set it in the add-on preferences)")
             return {"CANCELLED"}
         if clip.source not in {"MOVIE", "SEQUENCE"}:
             self.report({"ERROR"}, "Clip must be a movie file or image sequence")
