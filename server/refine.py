@@ -543,7 +543,22 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
             f_px_frames=f_fr.astype(np.float64), zoom=np.array(bool(zoom and solver == "lm")),
             rolling_shutter=np.array(rs), rolling_shutter_axis=np.array(getattr(ba, "rs_axis", "rows")),
         )
-        stats = dict(init=_stats(e_init[ok0]), round1=_stats(e1), final=_stats(e2), outlier_thresh_px=thr,
+        # Where in the image the solve struggles (3x3 grid): residual of kept observations and the share of
+        # observations rejected as outliers (things that move: people, foliage, reflections, screens).
+        gx = lambda o: np.clip((o[:, 2] * 3 / W).astype(int), 0, 2)  # noqa: E731
+        gy = lambda o: np.clip((o[:, 3] * 3 / H).astype(int), 0, 2)  # noqa: E731
+        cell_all = gy(obs_g) * 3 + gx(obs_g)
+        cell_kept = gy(kept_obs) * 3 + gx(kept_obs)
+        n_all = np.bincount(cell_all, minlength=9)
+        n_rej = np.bincount(cell_all[e1 >= thr], minlength=9)
+        g_med = [float(np.median(e2[cell_kept == c])) if (cell_kept == c).any() else None for c in range(9)]
+        pf = per_frame[np.isfinite(per_frame)]
+        bad = np.nonzero(per_frame > max(2.5 * float(np.median(pf)), 1.0))[0] if len(pf) else np.array([], int)
+        diag = dict(grid_n=n_all.tolist(), grid_reject=(n_rej / np.maximum(n_all, 1)).round(3).tolist(),
+                    grid_median=g_med, reject_frac=float((e1 >= thr).mean()),
+                    bad_frames=[int(result["frame_indices"][i]) for i in bad],
+                    tracks_per_frame=float(np.median(np.bincount(kf, minlength=T))))
+        stats = dict(init=_stats(e_init[ok0]), round1=_stats(e1), final=_stats(e2), outlier_thresh_px=thr, diag=diag,
                      prefilter_thresh_px=thr0, prefilter_kept=float(ok0.mean()),
                      tracks=int(pts_ok.sum()), observations=int(len(kept_obs)), plate=[W, H],
                      f_px=f, f_px_pi4=f0, k1=k1, k2=k2, solver=solver, distortion=bool(solve_dist), rolling_shutter=rs,

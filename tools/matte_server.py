@@ -6,6 +6,9 @@ POST /matte  {"job": str, "anchor": 30, "chunk": 30}
         (numbered source frame + 1), returns the fused matte's metrics.
 POST /set    {"job": str, "tris": 60000, "voxel": 0.04, "rebuild": false}
      -> low-poly set mesh (lowpoly.npz) + plate environment (plate_env.png) for the add-on's Build Set.
+POST /check  {"job": str}
+     -> overlay check (overlay_check.py): ground grid drawn with the solved camera into every frame,
+        check/overlay.mp4 + check/sheet.jpg and the KLT "stick" metric (grid vs. ground texture, px).
 POST /comp   {"job": str, "render_dir": "render", "out_dir": "comp", "soft": 0.6, "wrap": 0.25, "grain": "auto"}
      -> plate x shadow-catcher pass + matched CG (comp_plate.py), comp_####.png + <clip>_comp.mp4 + plate_vs_comp.mp4.
 MatAnyone 2: NTU S-Lab License 1.0 (non-commercial). SAM 2.1: Apache-2.0.
@@ -23,7 +26,7 @@ import torch
 
 import comp_plate
 import matte_pipeline as mp
-from progress import PROGRESS
+from progress import PROGRESS, Cancelled
 
 WORK = os.path.realpath(os.environ.get("WORK_DIR", "/work"))
 PORT = int(os.environ.get("PORT", "8766"))
@@ -50,18 +53,48 @@ def _plate_input(job):
     return os.path.join(ind, movies[0]), os.path.splitext(movies[0])[0]
 
 
-def _run_tool(name, args, stage, log):
-    """Run a /tools script as a subprocess, streaming its stdout into the job log."""
+def _run_tool(name, args, stage, log, job=""):
+    """Run a /tools script as a subprocess, streaming its stdout into the job log. Lines '@progress <0..1> <msg>'
+    update the stage's progress. Killed on POST /cancel. Returns the last JSON line it printed (or None)."""
     proc = subprocess.Popen(["python", "-u", os.path.join(os.path.dirname(__file__), name)] + args,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     t0 = time.time()
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line and "WARN" not in line:
-            log(line)
-    if proc.wait() != 0:
-        raise RuntimeError(f"{name} failed (exit {proc.returncode}), see log")
+    stop = threading.Event()
+
+    def watch():
+        while not stop.wait(0.5):
+            if job and PROGRESS.cancelled(job):
+                proc.kill()
+                return
+
+    threading.Thread(target=watch, daemon=True).start()
+    last_json = None
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith("@progress "):
+                parts = line.split(" ", 2)
+                try:
+                    PROGRESS.update(job, stage, float(parts[1]), parts[2] if len(parts) > 2 else None)
+                except Cancelled:
+                    pass                                  # the watcher kills the process
+                continue
+            if line.startswith("{"):
+                try:
+                    last_json = json.loads(line)
+                except ValueError:
+                    pass
+            if line and "WARN" not in line:
+                log(line)
+        rc = proc.wait()
+    finally:
+        stop.set()
+    if job and PROGRESS.cancelled(job):
+        raise Cancelled("cancelled by the user")
+    if rc != 0:
+        raise RuntimeError(f"{name} failed (exit {rc}), see log")
     log(f"{name} done in {time.time() - t0:.0f}s")
+    return last_json
 
 
 def _do_set(name, req):
@@ -72,17 +105,30 @@ def _do_set(name, req):
         PROGRESS.update(name, "mesh", 0.05, "fusing Pi4 depth, Poisson surface, decimation")
         _run_tool("build_lowpoly_mesh.py", [job, "--tris", str(int(req.get("tris", 60000))),
                                             "--voxel", str(float(req.get("voxel", 0.04))), "--max_depth", "35"],
-                  "mesh", log)
+                  "mesh", log, name)
     else:
         log("lowpoly.npz exists, reusing it (tick Rebuild to recompute)")
     PROGRESS.update(name, "mesh", 1.0)
     if rebuild or not os.path.isfile(os.path.join(job, "plate_env.png")):
         PROGRESS.update(name, "envmap", 0.1, "plate environment map")
-        _run_tool("build_plate_envmap.py", [job], "envmap", log)
+        _run_tool("build_plate_envmap.py", [job], "envmap", log, name)
     else:
         log("plate_env.png exists, reusing it")
     PROGRESS.update(name, "envmap", 1.0)
     return dict(lowpoly="lowpoly.npz", env="plate_env.png")
+
+
+def _do_check(name, req):
+    job = _job_dir(name)
+    log = lambda s: PROGRESS.log(name, s)  # noqa: E731
+    PROGRESS.update(name, "check", 0.02, "fitting the ground plane, drawing the grid")
+    rep = _run_tool("overlay_check.py", [job, "--out", "check", "--scale", str(float(req.get("scale", 0.5)))],
+                    "check", log, name) or {}
+    if "plane" in rep and rep["plane"] is None:
+        raise RuntimeError("no ground plane found below the camera (no floor visible?)")
+    with open(os.path.join(job, "check", "metrics.json"), "w") as fh:
+        json.dump(rep, fh, indent=1)
+    return dict(video="check/overlay.mp4", sheet="check/sheet.jpg", metrics=rep)
 
 
 def _do_comp(name, req):
@@ -130,6 +176,10 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
             return self._send(200, PROGRESS.get(q.get("job", [""])[0], int(q.get("since", ["0"])[0])))
+        if self.path.startswith("/cancel"):
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            return self._send(200, {"ok": PROGRESS.cancel(q.get("job", [""])[0])})
         if self.path != "/health":
             return self._send(404, {"error": "not found"})
         self._send(200, dict(status="ready", busy=_lock.locked(),
@@ -137,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
                              torch=torch.__version__))
 
     def do_POST(self):
-        if self.path in ("/set", "/comp"):
+        if self.path in ("/set", "/comp", "/check"):
             return self._post_job(self.path[1:])
         if self.path != "/matte":
             return self._send(404, {"error": "not found"})
@@ -159,6 +209,11 @@ class Handler(BaseHTTPRequestHandler):
             PROGRESS.finish(name, ok=True)
             self._send(200, dict(ok=True, metrics=rep.get("fused", {}), seconds=round(time.time() - t0, 1),
                                  alpha_dir="matte/fused", occlusion_dir="occlusion"))
+        except Cancelled:
+            torch.cuda.empty_cache()
+            PROGRESS.log(name, "cancelled by the user")
+            PROGRESS.finish(name, ok=False, error="cancelled")
+            self._send(200, {"ok": False, "cancelled": True, "error": "cancelled"})
         except Exception as e:
             traceback.print_exc()
             PROGRESS.log(name, f"ERROR {type(e).__name__}: {e}")
@@ -172,13 +227,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             name = req.get("job", "")
-            stages = [("mesh", 70), ("envmap", 30)] if kind == "set" else [("comp", 85), ("encode", 15)]
+            stages = {"set": [("mesh", 70), ("envmap", 30)], "comp": [("comp", 85), ("encode", 15)],
+                      "check": [("check", 100)]}[kind]
             PROGRESS.start(name, stages)
             t0 = time.time()
             with _lock:
-                out = _do_set(name, req) if kind == "set" else _do_comp(name, req)
+                out = {"set": _do_set, "comp": _do_comp, "check": _do_check}[kind](name, req)
             PROGRESS.finish(name, ok=True)
             self._send(200, dict(ok=True, seconds=round(time.time() - t0, 1), **out))
+        except Cancelled:
+            PROGRESS.log(name, "cancelled by the user")
+            PROGRESS.finish(name, ok=False, error="cancelled")
+            self._send(200, {"ok": False, "cancelled": True, "error": "cancelled"})
         except Exception as e:
             traceback.print_exc()
             PROGRESS.log(name, f"ERROR {type(e).__name__}: {e}")

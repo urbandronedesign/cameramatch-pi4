@@ -40,7 +40,13 @@ def foot_bones(arm):
 def walk_action(arm, name=""):
     if name and name in bpy.data.actions:
         return bpy.data.actions[name]
-    acts = [a for a in bpy.data.actions if "walk" in a.name.lower() and "jump" not in a.name.lower()]
+    pool = list(bpy.data.actions)
+    own = [bpy.data.actions[n] for n in arm.get("cm_actions", []) if n in bpy.data.actions]
+    if own:                                          # actions imported with THIS character (Add Character)
+        pool = own
+        if len(own) == 1:                            # e.g. a Mixamo FBX: one 'mixamo.com' action = the walk
+            return own[0]
+    acts = [a for a in pool if "walk" in a.name.lower() and "jump" not in a.name.lower()]
     if acts:
         return sorted(acts, key=lambda a: len(a.name))[0]
     ad = arm.animation_data

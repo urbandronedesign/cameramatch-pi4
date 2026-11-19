@@ -56,6 +56,12 @@ matte (tools)        on demand        docker compose --profile tools run --rm ma
 | `work/` | Job folders (`<clip>_<date>_<time>/`) and per-shot outputs |
 | `samples/` | Source clips. The full Tears of Steel film is in `samples/tos/` |
 
+**Ease of use (v0.12.0):** `engine.py` (background health poller, Start/Stop Engine through `docker compose`,
+starting Docker Desktop if needed), `guide.py` (footage presets, the solve grade and its suggestions, plain-language
+errors). The servers gained `GET /cancel?job=` (both), `POST /check` (matte server, runs `overlay_check.py`),
+`zoom: "auto"` and a `diag` block in the refinement stats (also written to `<job>/refine_stats.json`).
+`setup.ps1` installs everything; `tools/publish_images.ps1` pushes the images to GHCR.
+
 **Avoidance and characters (v0.11.0):** `collide.py` (obstacle KD-tree, mover registry `scene["cm_movers"]`,
 lateral-offset avoidance) and `characters.py` (walk-cycle analysis, NLA looping, arrival, foot-slide metric).
 
@@ -100,22 +106,25 @@ Neither ffmpeg nor OpenCV is installed on the Windows host. Run them inside the 
 
 ## 4. The add-on
 
-**Buttons:**
-- **Check Server**
-- **Solve Camera (Pi4)**: a modal operator with a progress bar and an ETA
-- **Re-import**
-- **Refine Matte (MatAnyone 2)**
-- **Show Log**: opens the `CameraMatch_Log` text block in its own window
-- **Clear Log**
+**Guided panel** (v0.12.0), the same in Movie Clip Editor and 3D Viewport > Sidebar > Pi4:
+- engine light with **Start / Stop**;
+- six steps, each ticked when done (from the scene state: footage pointer, `last_job/result.npz`, grade,
+  `cm_floor_coef`, `CM_Robot*` / `CM_Character*` collections, `scene["cm_last_comp"]`). The first unfinished step
+  is open; *Show All* opens the others. The Check step stays open while the grade is Fair or Poor;
+- 1 **Load Footage** / *Try the Sample Shot*; 2 **Footage** preset + **Solve Camera** / Re-solve;
+  3 grade, suggestions with fix buttons, **Check Overlay**, Show Footage, Set Real Scale;
+  4 **Build Set + Lighting**; 5 **Add Character**, New Path, **Walk Along Path**, **Walk to Cursor**,
+  Add Walking Robot, Place on Floor; 6 **Preview** / **Final Render**;
+- progress box with **Cancel**, plain-language result or error (raw text in the log), *Start Engine* when the
+  error says the engine is down;
+- collapsed sub-panels: *Advanced: Solve*, *Advanced: Set & Characters*, *Advanced: Render*, *More Tools*
+  (Refine Matte, Export Tracks, Re-import, Check Server).
 
-The progress bar also appears in the status bar.
+`_main_clip()` prefers the **Footage** pointer (`scene.cameramatch.clip`), so solve-side operators work from
+the 3D Viewport too, and the derived clips (`_check`, `_comp`, `_preview`, `_matte`, `_motion_mask`) are never
+taken for the footage. The progress bar also appears in the status bar.
 
-**CG Integration section** (v0.5.0), also in 3D Viewport > Sidebar > Pi4:
-- **Build Set + Lighting:** creates the `CM_Set` collection (floor catcher, projected walls, street proxy walls)
-  plus the plate environment world.
-- **Place on Floor**
-- **Add Walking Robot:** starts from the 3D cursor.
-- **Render & Comp:** writes the EXRs to `<job>/render`, then the comp and MP4s to `<job>/comp`.
+Render outputs: `<job>/render` + `<job>/comp` (final), `<job>/preview` + `<job>/comp_preview` (preview, 50 %).
 
 See README, "CG Integration buttons". The robot pipeline in §5.4 is what these buttons automate. Its
 street walls are detected along the camera's travel direction, with no fixed +Y assumption.
@@ -127,8 +136,9 @@ street walls are detected along the camera's travel direction, with no fixed +Y 
 | Refine at Plate Resolution | on | KLT plus bundle adjustment |
 | Solve Lens Distortion | on | **Turn off for slow or long-lens shots**: k1/k2 is poorly constrained and drags the focal |
 | Lock Focal to Pi4 | off | **Turn on for slow cinema shots** (sets focal_sigma to 0.002) |
-| Zoom Lens (Animate Focal) | off | Per-frame focal with a smoothness prior; the lens is keyframed |
-| Rolling Shutter | off | Solves the readout time (CMOS, fast handheld moves). Render & Comp matches it in Cycles |
+| Footage preset | Auto | Sets the rows below together (`guide.PRESETS`) |
+| Zoom | Auto | Auto: zoom solve when Pi4's smoothed per-frame focal varies > 8 % (`server.detect_zoom`) |
+| Rolling Shutter | Auto | Auto: on for portrait clips. Render & Comp matches it in Cycles |
 | Ignore Mask | — | A Mask datablock drawn in the clip editor, rasterised per frame at solve time; nothing is tracked inside it |
 | Ignore Trees / Water / Sky | **on** | OneFormer semantic masks added to the motion mask. Never hurt in the tests; halved the error on foliage |
 | Active Tracks | 600 | Tested sweet spot. More tracks make the solver slower without improving accuracy |
@@ -148,6 +158,9 @@ After Refine Matte you also get a `<clip>_matte` clip and a `<clip>_pi4_invdepth
 The scene frame rate is set from the clip (fixed 2026-11-19; earlier versions left 25 fps clips at 24).
 
 Headless drivers:
+- `tests/gui_guided.py`: the whole guided workflow in the real UI from an empty scene (engine, footage,
+  solve, cancel, overlay check, grade, one-click fix, set, character + walk to cursor, robot on a new path,
+  preview), with a screenshot per step in `<out>/shots/`.
 - `tests/gui_solve.py`: runs the real modal operator. Set the environment variables `CM_MAX_FRAMES`,
   `CM_SOLVE_DISTORTION=0/1` and `CM_LOCK_FOCAL=0/1`.
 - `tests/gui_matte.py`
@@ -319,6 +332,23 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
   - the Movie Distortion "Type" is a menu socket.
 - The RTX 5090 needs torch cu130 builds; upstream's cu126 builds won't run on it.
 
+### Ease-of-use layer (v0.12.0)
+- The grade thresholds (Good: median < 0.5 px and p90 < 1.5 px; Fair: < 1.0 / < 3.0 px) match the shots in §6:
+  every shot that looked right in review was Good.
+- Zoom auto-detection uses Pi4's own per-frame focal, so it costs nothing. The fixed-lens test shots stay
+  below 3.8 % (cycling clip); the synthetic 1.6x zoom reaches 46 %. The real `tos_zoom` clip shows 0.3 %:
+  Pi4 does not see that zoom, so a missed zoom still needs the Zoom lens preset.
+- Cancel works through the progress tracker: `Progress.update()` raises `Cancelled` once `/cancel` was
+  called, so every stage that reports progress stops there. Tool subprocesses (mesh, envmap, check) are
+  killed by a watcher thread. Pi4's single forward pass cannot be interrupted.
+- The first guided GUI run reported ALL PASS with an all-black preview comp: the user's startup Cube (2 m, at
+  the origin) enclosed the whole 0.8 m camera path. Operator return codes prove nothing; the GUI test now checks
+  the comp's pixels, and the add-on hides camera-enclosing objects from render (`hide_camera_blockers`).
+- Preview speed is per-frame overhead, not samples: 1.5 s/frame at 50 % / 24 samples, 1.1 s with persistent
+  data, motion blur on or off the same.
+- Never block Blender's UI on HTTP: the engine light is fed by a background thread, and a 1 s app timer only
+  redraws when the state text changes.
+
 ### Review discipline
 Always look at the frames before calling a result done:
 - 1:1 crops;
@@ -342,9 +372,8 @@ Most of the real bugs were caught this way.
   keeps the same rig, lighting and composite.
 - Avoidance with waiting (time-based yielding) for passages too narrow to pass side by side.
 - A real-footage zoom test (only synthetic so far).
-- Candidates: writing tracks into Blender's clip tracker, a metric-scale fix from a known measurement,
-  a curved walk path (the robot button walks a straight line), and an "Insert Asset" button for any rigged
-  character.
+- Publish the prebuilt images (GHCR) so `setup.ps1 -Pull` skips the 20–40 min build.
+- Mixamo FBX characters are handled in code (single imported action = the walk) but only tested on a glTF.
 
 ---
 
@@ -352,7 +381,9 @@ Most of the real bugs were caught this way.
 
 - The installed add-on is a **copy** at
   `%APPDATA%\Blender Foundation\Blender\5.3\extensions\user_default\cameramatch_pi4\`. After editing
-  `blender_addon/`, copy `__init__.py` there (or reinstall the zip from `dist/`).
+  `blender_addon/`, copy **every** `.py` there (the add-on has several modules), or reinstall the zip from `dist/`.
+- Releases: bump `blender_manifest.toml`, build the zip, `gh release create v<version> dist/cameramatch_pi4-<version>.zip`.
+  Prebuilt images: `tools/publish_images.ps1` (needs `gh auth refresh -s write:packages`, pushes about 45 GB).
 - After changing `tools/`, nothing needs rebuilding: the folder is bind-mounted. The matte-server only
   picks up changes after a restart (`docker compose restart matte-server`). After rebuilding the
   matte image, recreate the container with `docker compose up -d matte-server`; a restart keeps the

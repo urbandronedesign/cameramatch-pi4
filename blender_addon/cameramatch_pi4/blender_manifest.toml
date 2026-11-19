@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "cameramatch_pi4"
-version = "0.11.0"
+version = "0.12.0"
 name = "CameraMatch Pi4"
-tagline = "Automatic camera solve from a movie clip using the Pi4 model"
+tagline = "Guided camera match: solve, check, add characters, render"
 maintainer = "CameraMatch contributors"
 type = "add-on"
 

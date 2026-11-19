@@ -11,6 +11,67 @@ Camera matching for Blender in two stages:
 > **License:** this add-on is GPL-3.0. OneFormer (semantic masks) is MIT-licensed, pulled into the Docker image. The π⁴ code and weights are **CC BY-NC 4.0,
 > non-commercial only**. They are pulled into the Docker image, never bundled with the add-on.
 
+## Quickstart
+
+![The six steps in Blender: load footage, solve, check, build the set, add characters, render](docs/media/walkthrough.gif)
+
+*45-second walkthrough recorded by the GUI test (`tests/gui_guided.py`); full-size video on the
+[v0.12.0 release](https://github.com/urbandronedesign/cameramatch-pi4/releases/tag/v0.12.0).*
+
+**You need:** Windows 11 with WSL2, an NVIDIA GPU (tested on an RTX 5090; 12 GB+ VRAM recommended, driver 570+),
+Docker Desktop, Blender 5.1+ (5.3 tested), and about 60 GB free on the drive where Docker keeps its data.
+
+### Install (once)
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (WSL2 backend). If your C: drive is
+   small, first move its data: *Settings > Resources > Advanced > Disk image location*.
+2. Clone or download this repository, then in its folder run:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File setup.ps1
+   ```
+   It checks WSL2, the GPU, Docker and the free space, builds the engine (20–40 min the first time; with `-Pull`
+   it downloads prebuilt images instead, once they are published), starts it (the first start downloads the
+   models), installs the Blender add-on and points it at this folder. It ends with **READY** or the exact list
+   of what is missing. `setup.ps1 -CheckOnly` only reports.
+3. Updating later: download the new `cameramatch_pi4-<version>.zip` from
+   [Releases](https://github.com/urbandronedesign/cameramatch-pi4/releases) and drag it onto Blender
+   (or *Preferences > Get Extensions > Install from Disk*).
+
+### The six steps
+Blender > **Movie Clip Editor** or **3D Viewport** > press **N** > **Pi4** tab. The top line is the engine
+light: click **Start** if it is not green (Docker and the engine start by themselves). Then follow the steps.
+The current one is open; finished ones get a tick (**Show All** opens them again).
+
+1. **Load Footage:** a video or the first image of a PNG/JPG sequence. No footage yet? **Try the Sample Shot**
+   downloads a street shot and a free character.
+2. **Solve Camera:** pick the **Footage** type (*Auto* detects zooms and portrait phone video by itself;
+   *Phone*, *Drone*, *Tripod / slow pan*, *Zoom lens*, *Cinema camera*, *Night*), then **Solve Camera**
+   (about 1 minute for 120 frames). **Cancel** in the progress box stops it.
+3. **Check the Solve:** a grade (*Good / Fair / Poor*) with plain suggestions, each with a one-click fix that
+   re-solves (for example *Turn on Ignore Trees / Water / Sky*, *Turn on Rolling Shutter*, or *Draw Ignore
+   Mask* over a moving area). **Check Overlay** draws a grid on the ground into every frame: if it stays glued
+   to the ground, CG will too. **Show Footage** switches the Clip Editor back. *Set Real Scale* is optional.
+4. **Build Set + Lighting:** floor shadow catcher, walls, and the footage itself as lighting.
+5. **Add Characters:** **Add Character** imports a rigged glTF/GLB/FBX character (for example Mixamo, exported
+   with an *in place* walk) at the 3D cursor, scaled to *Character Height*. Then either **Walk to Cursor**
+   (Shift+right-click where it should go) or **New Path** (shape the curve), select the character too and
+   **Walk Along Path**. Feet stay planted; characters avoid walls and each other. **Add Walking Robot** adds
+   the procedural robot.
+6. **Render:** **Preview** (half resolution, 24 samples, about 1 s per frame) to check, then **Final Render**. Both
+   composite over the footage and load the result as a clip; the videos are in the job folder.
+
+All the other settings are in the collapsed **Advanced** panels below the steps.
+
+### Shooting tips (what makes a shot easy to match)
+- **Move the camera** (walk, dolly, drone): sideways or forward travel gives depth. A pure pan on a tripod is
+  the hardest case (use the *Tripod* preset).
+- **Keep the zoom still** if you can. Zooms work (*Zoom lens* preset), but a fixed focal is more accurate.
+- **Texture in frame:** paving, walls, foliage edges. Avoid shots filled with sky, water, blank walls or
+  moving crowds.
+- **Show the ground** where CG will stand; the floor is fitted from it.
+- **Short shutter, good light:** motion blur and noise remove trackable detail.
+- **Phones:** shoot in the highest resolution, avoid electronic stabilisation jumps; portrait video is fine
+  (rolling shutter is solved automatically).
+
 ## Accuracy (synthetic ground truth, 1920×1080, 120 frames, 24 mm, k1 −0.08 / k2 0.02)
 | | π⁴ only | π⁴ + refinement |
 |---|---|---|
@@ -36,18 +97,17 @@ dist/                    built extension zip
 work/                    shared jobs folder (host <-> container)
 ```
 
-## Setup
+## Manual setup (what setup.ps1 does)
 1. Docker Desktop (WSL2 backend) with GPU support. Image, build cache and weights live in Docker's disk
    image (here `D:\DockerData`).
 2. `docker compose up -d --build` (first start downloads the weights from Hugging Face `yyfz233/Pi4`; no token needed).
 3. `docker compose logs -f pi4` until `model ready`.
-4. Blender 5.3 > Edit > Preferences > Get Extensions > ⌄ > Install from Disk > `dist/cameramatch_pi4-0.5.0.zip`.
+4. Blender > Edit > Preferences > Get Extensions > ⌄ > Install from Disk > `dist/cameramatch_pi4-<version>.zip`.
    In the add-on preferences, set **Work folder** to `<your clone>/work`, the folder docker-compose mounts as
    `/work`. Alternatively, set the `CAMERAMATCH_WORK` environment variable before starting Blender.
 
-## Use
-Movie Clip Editor > open a clip (movie file or PNG/JPG sequence) > set the clip's **sensor width**
-(Track > Camera; focal in mm depends on it) > Sidebar **Pi4** > **Check Server** > **Solve Camera (Pi4)**.
+## What a solve imports
+Set the clip's **sensor width** (Clip Editor > Track > Camera) if you need the focal in real millimetres.
 
 You get a collection `Pi4_<clip>`:
 - animated camera (first frame at origin looking +Y, Z up; clip as background; scene range set),
@@ -57,9 +117,9 @@ You get a collection `Pi4_<clip>`:
 - the clip's tracking camera gets focal + (refined) **Polynomial k1/k2**. Use a *Movie Distortion* node
   to distort CG renders to match the plate.
 
-Settings: *Refine at Plate Resolution* (default on), *Active Tracks* (600 is the tested sweet spot),
-*Zoom Lens (Animate Focal)* (per-frame focal for zoom shots),
-*Frame Stride* / *Max Frames* / *Model Resolution* (GPU memory budget), *Animate Focal Length* (π⁴ only).
+Advanced settings: *Refine at Plate Resolution* (default on), *Active Tracks* (600 is the tested sweet spot),
+*Zoom* (Auto / Zoom Lens / Fixed Focal), *Rolling Shutter* (Auto / On / Off),
+*Frame Stride* / *Max Frames* / *Model Resolution* (GPU memory budget).
 
 ## RTX 5090 budget (512 px, motion detection on)
 | frames | VRAM | Pi4 time |
@@ -79,6 +139,59 @@ Settings: *Refine at Plate Resolution* (default on), *Active Tracks* (600 is the
 - Pure nodal pans: depth is unobservable; the solve is held up by the π⁴ priors.
 - Video decoded with OpenCV (H.264/H.265/MJPEG fine; ProRes may not be). TIFF/EXR sequences unsupported.
 - Upstream π⁴ is very new (released 2026-11-17); pinned to commit `32dfbea`.
+
+## Ease of use (v0.12.0)
+- **setup.ps1:** one-command install with checks (WSL2, GPU and driver, Docker and its data drive's free space,
+  Blender), engine build or download (`-Pull`), first start, add-on install and configuration. Maintainers
+  publish the images with `tools/publish_images.ps1`.
+- **Engine light + Start / Stop Engine** in the panel and the preferences: the add-on runs `docker compose`
+  itself (starting Docker Desktop if needed) and polls both servers in the background.
+- **Guided panel** in the Clip Editor and the 3D Viewport: six steps with ticks, the current step open,
+  everything else under collapsed *Advanced* panels.
+- **Footage presets** (Auto, Phone, Drone, Tripod / slow pan, Zoom lens, Cinema camera, Night). *Auto* turns the
+  zoom solve on when π⁴'s per-frame focal varies more than 8 % over the shot (fixed-lens test shots: at most
+  3.8 %; a 1.6× zoom: 46 %), and rolling shutter on for portrait footage.
+- **Solve grade with suggestions:** from the refinement's residuals, the 3×3 map of rejected features (where in
+  the frame things move), tracks per frame, poorly tracked frames, the overlay check and the clip's shape. Each
+  suggestion has a one-click fix (setting + Re-solve, or a new Ignore Mask in Mask mode).
+- **Check Overlay** button (`POST /check` on the matte server): the ground-grid video loads as a clip, and its
+  slide measure feeds the grade.
+- **Cancel** for Solve, Re-solve, Matte, Build Set, Check and the comp (`GET /cancel?job=` on both servers;
+  the job stops at its next step, π⁴'s single forward pass excepted; renders stop with Esc). Errors are shown in
+  plain words, with a **Start Engine** button when the engine is down; the full text stays in the log.
+- **Preview render:** half resolution, 24 samples, persistent data (1.1 s per frame on the Venice set, against
+  1.5 s without it), comp at that size.
+- **Camera blockers:** after a solve and before a render, objects the solved camera sits inside are hidden from
+  render (the startup Cube is at the origin, exactly where the first solved camera is, and filled every frame of
+  the first test preview).
+- **Characters:** *Add Character* (glTF/GLB/FBX, scaled, on the floor at the cursor, its own actions
+  remembered for walk detection), *Walk to Cursor*, *New Path*; *Walk Along Path* accepts the selection in
+  any order.
+- **Try the Sample Shot** (Mixkit #4600 + CC0 RobotExpressive), **Quickstart** opens this page.
+
+- **Paths drawn into a wall:** the walkable street is the fitted floor *in sight of the camera path*. Path
+  points behind a wall are moved sideways onto the street (spread smoothly along the path), pushes off a wall
+  never land on the building side, and a path running past the reconstructed street is left as drawn, with a
+  note in the log. Animated hierarchies (an imported character's child meshes) are movers, not walls.
+
+GUI test (`tests/gui_guided.py`: the real Blender UI from the user's startup scene, Venice sample, 120 frames),
+all 20 checks pass in 335 s:
+
+| Step | Result |
+|---|---|
+| Engine light, Load Footage | ready (RTX 5090); 1920×1080, 284 frames |
+| Solve (Auto preset) | 0.28 px median, grade *Good*; zoom auto: fixed focal (Pi4 focal range 1.1 %) |
+| Startup Cube enclosing the camera path | hidden from render automatically |
+| Cancel a Re-solve | stops within seconds, previous solve kept |
+| Check Overlay | grid slide 0.45 px median over 1894 samples |
+| One-click fix (rolling shutter) | re-solves in 21 s |
+| Build Set | floor fit 0.5 cm |
+| Add Character + Walk to Cursor | 8.0 m at 1.43 m/s, planted-foot slide 7.6 cm/s median |
+| Robot on a New Path drawn partly inside the left wall | closest wall 0.41 m (was 0.01 m before the walkable-street fix) |
+| Preview render + comp | 160 s for 120 frames; comp checked for pixels (not black) |
+
+`tests/check_offfloor.py`: a path drawn through a wall ends 0.40 m from it with a smooth bend (5°/m).
+`tests/check_collide_walk.py` and `tests/check_paths.py` give the same numbers as v0.11.0.
 
 ## Solver and robustness tools (v0.6.0)
 **Bundle adjustment:** `server/ba_lm.py`, a GPU Levenberg-Marquardt solver with Schur complement. The 3D
@@ -366,6 +479,8 @@ Solve: *Solve Lens Distortion* off, *Lock Focal to Pi4* on -> 0.35 px median, f 
 
 ## Tests
 ```
+blender --python tests/gui_guided.py -- <footage.mp4> <character.glb> <out_dir> [max_frames]  # whole guided flow, real UI
+blender -b <scene with set + CM_path>.blend --python tests/check_offfloor.py      # paths drawn into walls
 blender -b --factory-startup --python tests/blender_smoke.py                    # import/axes, no server
 blender -b --factory-startup --python tests/blender_e2e.py -- <video|first_png>  # full chain
 # Synthetic ground truth:

@@ -102,7 +102,11 @@ def run(plate, exr_dir, out, frames=None, grain="auto", soft=0.6, wrap=0.25, lif
         E = read_exr(exrs[fnum])
         cg = E["Combined"][..., [2, 1, 0, 3]]            # RGBA -> BGRA, premultiplied linear
         if cg.shape[:2] != plate_fr.shape[:2]:
-            raise RuntimeError(f"render {cg.shape[1]}x{cg.shape[0]} != plate {plate_fr.shape[1]}x{plate_fr.shape[0]}")
+            ry, rx = cg.shape[0] / plate_fr.shape[0], cg.shape[1] / plate_fr.shape[1]
+            if abs(ry - rx) > 0.01 or ry > 1:
+                raise RuntimeError(f"render {cg.shape[1]}x{cg.shape[0]} != plate {plate_fr.shape[1]}x{plate_fr.shape[0]}")
+            # preview render (reduced resolution percentage): comp at the render's size
+            plate_fr = cv2.resize(plate_fr, (cg.shape[1], cg.shape[0]), interpolation=cv2.INTER_AREA)
         shad = np.clip(E["Shadow Catcher"][..., ::-1], 0, 1.5) if "Shadow Catcher" in E else 1.0
         pl = srgb2lin(plate_fr.astype(np.float32) / 255.0)
         bg = pl * shad

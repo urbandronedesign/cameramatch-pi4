@@ -3,16 +3,36 @@ import threading
 import time
 
 
+class Cancelled(Exception):
+    """Raised inside a job (at its next progress update) after POST /cancel."""
+
+
 class Progress:
     def __init__(self):
         self._lock = threading.Lock()
         self._jobs = {}
+        self._cancel = set()
+
+    def cancel(self, job):
+        """Ask a running job to stop: its next update() raises Cancelled."""
+        with self._lock:
+            j = self._jobs.get(job)
+            if not j or j["state"] != "running":
+                return False
+            self._cancel.add(job)
+            j["msg"] = "cancelling..."
+            return True
+
+    def cancelled(self, job):
+        with self._lock:
+            return job in self._cancel
 
     def start(self, job, stages):
         """stages: list of (name, weight). Resets the job."""
         with self._lock:
             self._jobs[job] = dict(stages=list(stages), done={}, stage=stages[0][0], frac=0.0, msg="",
                                    log=[], t0=time.time(), state="running", error=None)
+            self._cancel.discard(job)
 
     def add_stages(self, job, stages):
         with self._lock:
@@ -22,6 +42,8 @@ class Progress:
 
     def update(self, job, stage, frac, msg=None):
         with self._lock:
+            if job in self._cancel:
+                raise Cancelled("cancelled by the user")
             j = self._jobs.get(job)
             if not j:
                 return
@@ -41,6 +63,7 @@ class Progress:
     def finish(self, job, ok=True, error=None):
         with self._lock:
             j = self._jobs.get(job)
+            self._cancel.discard(job)
             if j:
                 j["state"] = "done" if ok else "error"
                 j["error"] = error

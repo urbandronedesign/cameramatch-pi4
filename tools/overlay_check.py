@@ -114,6 +114,9 @@ def main():
     drift = []          # |KLT - projection| over frames for points tracked from their first visible frame
     drift_rate = []
     prev_gray = None
+    if os.path.isdir(src):                                # image sequence copied by the add-on: input/seq/000000.png
+        first = sorted(os.listdir(src))[0]
+        src = os.path.join(src, "%06d" + os.path.splitext(first)[1])
     cap = cv2.VideoCapture(src)
     if W is None:
         W, H = int(cap.get(3)), int(cap.get(4))
@@ -124,6 +127,8 @@ def main():
     tiles = []
     fi = 0
     for k, fr_i in enumerate(idx):
+        if k % 10 == 0:
+            print(f"@progress {0.95 * k / len(idx):.3f} grid overlay frame {k + 1}/{len(idx)}", flush=True)
         while fi <= fr_i:
             ok, img = cap.read()
             fi += 1

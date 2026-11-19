@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from progress import PROGRESS
+from progress import PROGRESS, Cancelled
 
 WORK = os.path.realpath(os.environ.get("WORK_DIR", "/work"))
 PORT = int(os.environ.get("PORT", "8765"))
@@ -125,7 +125,10 @@ def solve(req):
     def tick():
         while not ticking.wait(0.5):
             el = time.time() - t1
-            PROGRESS.update(job, "pi4", min(0.95, el / expected), f"Pi4 inference {el:.0f}s / ~{expected:.0f}s")
+            try:
+                PROGRESS.update(job, "pi4", min(0.95, el / expected), f"Pi4 inference {el:.0f}s / ~{expected:.0f}s")
+            except Cancelled:      # the forward pass cannot be interrupted: the job stops right after it
+                return
 
     plog(f"Pi4 inference on {T} frames (tracking {'on' if query is not None else 'off'}), ~{expected:.0f}s")
     th = threading.Thread(target=tick, daemon=True)
@@ -233,6 +236,21 @@ def _ignore_classes(req):
     return list(v)
 
 
+# Pi4's per-frame focal varies < 4 % (smoothed 5-95 % range) on every fixed-lens test shot and 46 % on the
+# synthetic 1.6x zoom: 8 % separates them with margin.
+ZOOM_AUTO_RANGE = 0.08
+
+
+def detect_zoom(fx):
+    """Zoom shot? From Pi4's per-frame focal (model pixels). Returns (is_zoom, relative smoothed range)."""
+    fx = np.asarray(fx, np.float64).reshape(-1)
+    if len(fx) < 12:
+        return False, 0.0
+    s = np.convolve(fx, np.ones(9) / 9, "valid")
+    rng = float((np.percentile(s, 95) - np.percentile(s, 5)) / np.median(fx))
+    return rng > ZOOM_AUTO_RANGE, rng
+
+
 def run_refine(req, started=False):
     """Plate-resolution KLT + bundle adjustment on top of an existing Pi4 result."""
     import refine as rf
@@ -248,6 +266,13 @@ def run_refine(req, started=False):
         cache = {k: z[k] for k in z.files}
     src = _job_path(job, str(cache["src"]))
     t0 = time.time()
+    zoom = req.get("zoom", False)
+    zoom_auto = None
+    if zoom == "auto":
+        zoom, zr = detect_zoom(result["fx"])
+        zoom_auto = dict(zoom=bool(zoom), focal_range=round(zr, 4))
+        plog(f"zoom auto-detect: Pi4 focal varies {zr * 100:.1f}% over the shot -> "
+             f"{'zoom lens (per-frame focal)' if zoom else 'fixed focal'}")
     out, stats = rf.refine(src, result, cache, log=plog,
                            progress=lambda st, fr, msg=None: PROGRESS.update(job, st, fr, msg),
                            max_active=int(req.get("max_tracks", 600)),
@@ -255,7 +280,7 @@ def run_refine(req, started=False):
                            quality=float(req.get("klt_quality", 0.001)),
                            focal_sigma=float(req.get("focal_sigma", 0.3)),
                            solve_distortion=bool(req.get("solve_distortion", True)),
-                           solver=str(req.get("solver", "lm")), zoom=bool(req.get("zoom", False)),
+                           solver=str(req.get("solver", "lm")), zoom=bool(zoom),
                            zoom_smooth=float(req.get("zoom_smooth", 0.01)),
                            rolling_shutter=bool(req.get("rolling_shutter", False)),
                            rs_axis=str(req.get("rs_axis", "auto")),
@@ -264,6 +289,11 @@ def run_refine(req, started=False):
     result.update(out)
     np.savez(res_path, **result)
     stats["refine_s"] = round(time.time() - t0, 2)
+    if zoom_auto is not None:
+        stats["zoom_auto"] = zoom_auto
+    stats["plate_portrait"] = bool(stats.get("plate", [1, 0])[1] > stats.get("plate", [1, 0])[0])
+    with open(os.path.join(out_dir, "refine_stats.json"), "w") as fh:
+        json.dump(stats, fh, indent=1)
     plog(f"refinement done in {stats['refine_s']}s")
     return stats
 
@@ -282,6 +312,10 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
             return self._send(200, PROGRESS.get(q.get("job", [""])[0], int(q.get("since", ["0"])[0])))
+        if self.path.startswith("/cancel"):
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            return self._send(200, {"ok": PROGRESS.cancel(q.get("job", [""])[0])})
         if self.path == "/health":
             info = dict(_state)
             if torch.cuda.is_available():
@@ -304,6 +338,11 @@ class Handler(BaseHTTPRequestHandler):
                 result = solve(req) if self.path == "/solve" else {"ok": True, "refine": run_refine(req)}
             PROGRESS.finish(req.get("job", ""), ok=True)
             self._send(200, result)
+        except Cancelled:
+            torch.cuda.empty_cache()
+            PROGRESS.log(req.get("job", ""), "cancelled by the user")
+            PROGRESS.finish(req.get("job", ""), ok=False, error="cancelled")
+            self._send(200, {"ok": False, "cancelled": True, "error": "cancelled"})
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             msg = "GPU out of memory: raise stride, lower max frames/size, or disable motion"

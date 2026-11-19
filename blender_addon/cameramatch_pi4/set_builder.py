@@ -370,7 +370,7 @@ def build_set(scene, clip, job_dir, log, street_walls=True, wall_height=14.0):
 
 
 # --------------------------------------------------------------------------- render setup
-def setup_render(scene, out_dir, samples=192, motion_blur=True, exposure=0.5, log=print):
+def setup_render(scene, out_dir, samples=192, motion_blur=True, exposure=0.5, log=print, percentage=100):
     scene.render.engine = "CYCLES"
     try:
         cp = bpy.context.preferences.addons["cycles"].preferences
@@ -411,7 +411,7 @@ def setup_render(scene, out_dir, samples=192, motion_blur=True, exposure=0.5, lo
         pass
     scene.view_settings.view_transform = "Standard"    # plate-consistent (sRGB in = sRGB out)
     scene.view_settings.look = "None"
-    scene.render.resolution_percentage = 100
+    scene.render.resolution_percentage = percentage    # < 100: preview render (comp at that size)
     vl = scene.view_layers[0]
     vl.cycles.use_pass_shadow_catcher = True
     scene.render.use_compositing = False
