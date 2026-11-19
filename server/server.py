@@ -245,7 +245,9 @@ def run_refine(req, started=False):
                            focal_sigma=float(req.get("focal_sigma", 0.3)),
                            solve_distortion=bool(req.get("solve_distortion", True)),
                            solver=str(req.get("solver", "lm")), zoom=bool(req.get("zoom", False)),
-                           zoom_smooth=float(req.get("zoom_smooth", 0.01)))
+                           zoom_smooth=float(req.get("zoom_smooth", 0.01)),
+                           rolling_shutter=bool(req.get("rolling_shutter", False)),
+                           rs_axis=str(req.get("rs_axis", "auto")))
     PROGRESS.update(job, "write", 0.5, "writing result")
     result.update(out)
     np.savez(res_path, **result)

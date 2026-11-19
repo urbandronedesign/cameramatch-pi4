@@ -297,14 +297,36 @@ def _undistort(xd, yd, k1, k2, iters=20):
     return x, y
 
 
-def holdout_error(held, c2w, f_fr, k1, k2, cx, cy, min_obs=5):
+def _rs_poses(c2w, fr, srow, rs):
+    """Per-observation world->cam [R|t] at the row's capture time (same model as ba_lm._project_rs)."""
+    from scipy.spatial.transform import Rotation
+    T = len(c2w)
+    Rw = np.transpose(c2w[:, :3, :3], (0, 2, 1))
+    C = c2w[:, :3, 3]
+    nxt, prv = np.minimum(np.arange(T) + 1, T - 1), np.maximum(np.arange(T) - 1, 0)
+    dt = np.maximum(nxt - prv, 1)[:, None]
+    om = Rotation.from_matrix(Rw[nxt] @ np.transpose(Rw[prv], (0, 2, 1))).as_rotvec() / dt
+    V = (C[nxt] - C[prv]) / dt
+    t = (srow * rs)[:, None]
+    R = Rotation.from_rotvec(t * om[fr]).as_matrix() @ Rw[fr]
+    Cr = C[fr] + t * V[fr]
+    P = np.concatenate([R, -np.einsum("nij,nj->ni", R, Cr)[:, :, None]], 2)
+    return P
+
+
+def holdout_error(held, c2w, f_fr, k1, k2, cx, cy, min_obs=5, rs=0.0, H=None, W=None, axis="rows"):
     """Triangulate each held-out track from the solved cameras alone (linear, undistorted rays) and return the
-    reprojection error statistics of its observations: a camera-only accuracy measure."""
+    reprojection error statistics of its observations: a camera-only accuracy measure. With a rolling
+    shutter (rs != 0) every observation uses the pose at its row's capture time."""
     fr = held[:, 0].astype(int)
     tid = held[:, 1].astype(np.int64)
     f = np.asarray(f_fr)[fr]
     x, y = _undistort((held[:, 2] - cx) / f, (held[:, 3] - cy) / f, k1, k2)
-    w2c = np.linalg.inv(c2w)
+    if rs and H:
+        s_ = (held[:, 2] - cx) / W if axis == "cols" else (held[:, 3] - cy) / H
+        Pobs = _rs_poses(c2w, fr, s_, rs)
+    else:
+        Pobs = np.linalg.inv(c2w)[fr, :3, :]
     errs, ntr = [], 0
     order = np.argsort(tid, kind="stable")
     tid_s = tid[order]
@@ -314,7 +336,7 @@ def holdout_error(held, c2w, f_fr, k1, k2, cx, cy, min_obs=5):
         if b - a < min_obs:
             continue
         ii = order[a:b]
-        Pm = w2c[fr[ii], :3, :]                                  # (m, 3, 4)
+        Pm = Pobs[ii]                                            # (m, 3, 4)
         A = np.concatenate([x[ii, None] * Pm[:, 2] - Pm[:, 0], y[ii, None] * Pm[:, 2] - Pm[:, 1]])
         X = np.linalg.svd(A)[2][-1]
         if abs(X[3]) < 1e-12:
@@ -341,11 +363,14 @@ def _stats(e):
 
 def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nfev=50, quality=0.001,
            focal_sigma=0.3, progress=None, solve_distortion=True, solver="lm", zoom=False, zoom_smooth=0.01,
-           zoom_anchor="pi4", holdout_frac=0.0):
+           zoom_anchor="pi4", holdout_frac=0.0, rolling_shutter=False, rs_axis="auto"):
     """result: dict from result.npz; cache: dict(depth [T,Hm,Wm] metric, dyn [T,Hm,Wm]).
     progress(stage, frac, msg) is called with stages 'klt' and 'ba'.
     solver: "lm" (GPU Levenberg-Marquardt + Schur complement, ba_lm.py) or "scipy" (TRF + LSMR, class BA).
     zoom: one focal per frame (LM solver only), prior to Pi4's per-frame focal + smoothness zoom_smooth.
+    rolling_shutter: solve a sensor readout time (fraction of a frame step, signed: + = top row first), the
+    pose of each row following the camera's motion (phones, most CMOS video cameras). LM solver only.
+    rs_axis: "rows", "cols" or "auto" (cols for portrait video: an upright phone reads out across columns).
     holdout_frac: keep that fraction of tracks out of the solve and report their error. This measures the
     solve's self-consistency, NOT its correctness: on the synthetic GT a wrong lens model (no k1/k2, focal
     17% off, 2.6 deg rotation error) predicts held-out tracks as well as the right one, so it cannot be used
@@ -425,7 +450,7 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
             f_init = np.asarray(result["fx"], np.float64).reshape(-1) * sx if zoom else None
             ba = LMBA(c2w, f0, plate, obs_g, X0, prior_sigma=prior_frac * med_depth, device=dev,
                       focal_sigma=focal_sigma, k_sigma=k_sigma, zoom=zoom, f_init=f_init, zoom_smooth=zoom_smooth,
-                      zoom_anchor=zoom_anchor)
+                      zoom_anchor=zoom_anchor, rolling_shutter=rolling_shutter, rs_axis=rs_axis)
         else:
             if zoom:
                 log("[refine] zoom needs the LM solver: solving one constant focal")
@@ -462,6 +487,7 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
         f_fr = ba.f_frames(x)
         f = float(np.median(f_fr))
         k1, k2 = ba.k12(x)
+        rs = ba.readout(x) if hasattr(ba, "readout") else 0.0
 
         # Per-frame median error and the points that survived (>= 2 inlier observations).
         kf = kept_obs[:, 0].astype(int)
@@ -484,19 +510,22 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
             track_points=X.cpu().numpy()[pts_ok].astype(np.float32), track_colors=colors[pts_ok],
             reproj_per_frame_px=per_frame.astype(np.float32),
             f_px_frames=f_fr.astype(np.float64), zoom=np.array(bool(zoom and solver == "lm")),
+            rolling_shutter=np.array(rs), rolling_shutter_axis=np.array(getattr(ba, "rs_axis", "rows")),
         )
         stats = dict(init=_stats(e_init[ok0]), round1=_stats(e1), final=_stats(e2), outlier_thresh_px=thr,
                      prefilter_thresh_px=thr0, prefilter_kept=float(ok0.mean()),
                      tracks=int(pts_ok.sum()), observations=int(len(kept_obs)), plate=[W, H],
-                     f_px=f, f_px_pi4=f0, k1=k1, k2=k2, solver=solver, distortion=bool(solve_dist),
+                     f_px=f, f_px_pi4=f0, k1=k1, k2=k2, solver=solver, distortion=bool(solve_dist), rolling_shutter=rs,
                      f_px_range=[float(f_fr.min()), float(f_fr.max())])
         if held is not None and len(held):
-            stats["holdout"] = holdout_error(held, c2w_ref, f_fr, k1, k2, cx, cy)
+            stats["holdout"] = holdout_error(held, c2w_ref, f_fr, k1, k2, cx, cy, rs=rs, H=H, W=W,
+                                             axis=getattr(ba, "rs_axis", "rows"))
             log(f"[refine]{tag} HOLDOUT (tracks never seen by the solve): median "
                 f"{stats['holdout']['median']:.3f}px, p90 {stats['holdout']['p90']:.3f}px over "
                 f"{stats['holdout']['tracks']} tracks")
         log(f"[refine]{tag} final reprojection: median {stats['final']['median']:.3f}px, p90 "
-            f"{stats['final']['p90']:.3f}px, f {f0:.1f}->{f:.1f}px, k1 {k1:.4f}, k2 {k2:.4f}")
+            f"{stats['final']['p90']:.3f}px, f {f0:.1f}->{f:.1f}px, k1 {k1:.4f}, k2 {k2:.4f}"
+            f"{f', readout {rs:+.3f} frame' if rolling_shutter else ''}")
         return out, stats
 
     split = None

@@ -115,6 +115,30 @@ from the solved projection.
 
 Checks: `blender -b <solved.blend> --python tests/check_robust_features.py -- [zoom_job first_png gt.json]`.
 
+## Rolling shutter (v0.7.0)
+*Rolling Shutter* (Pi4 tab, refine options) solves the sensor readout time as one global value: a signed
+fraction of a frame, where + means the top row is read first. Each observation uses the pose at its row's
+capture time, following the camera's angular and linear velocity from the neighbouring frames. Portrait video
+is read out across columns (an upright phone), which `rs_axis="auto"` selects. Render & Comp then renders the
+CG with the matching Cycles rolling shutter: shutter window = readout + exposure, top row first.
+
+| | global-shutter model | **rolling-shutter model** |
+|---|---|---|
+| Synthetic handheld GT, readout 0.8: trajectory / rotation error | 0.671 % / 0.651° | **0.117 % / 0.275°** |
+| … focal (GT 1280), readout found | 1294 px, — | **1283 px, +0.898** |
+| Japan crowd (handheld camera): median, holdout | 0.393 / 0.597 px | **0.362 / 0.555 px** (readout +0.59) |
+| Park path (phone, portrait) | 0.860 px | 0.859 px (readout ≈ 0) |
+
+- Test the ground truth with `tests/gt_render_rs.py` (12 sub-frames per frame) followed by `tests/gt_rolling_compose.py`.
+- `tests/check_rs_render.py` checks the Cycles side. On the crowd shot, rendered spheres land 1.66 px from
+  the tracked features, against 1.72 px for the solver's own projection (2.71 px with Cycles rolling shutter off).
+- **The phone walk is not limited by rolling shutter.** Its residuals are 1.2–1.6 px in the tree canopy, which holds
+  71 % of the tracks, against 0.65 px on the ground: the leaves move in the wind. The phone's electronic
+  stabilisation probably removed most of the rolling shutter. Foliage-heavy shots need region masking or
+  weighting, which is not implemented yet.
+- Only top-to-bottom row readout can be reproduced in Cycles. Other readouts are solved, but the CG is rendered
+  with a global shutter, and the log says so.
+
 ## Hard-footage test (2026-11-19)
 Five shots, each targeting one weakness, solved with default settings (LM solver, 600 tracks):
 

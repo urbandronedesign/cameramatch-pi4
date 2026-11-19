@@ -370,7 +370,7 @@ def build_set(scene, clip, job_dir, log, street_walls=True, wall_height=14.0):
 
 
 # --------------------------------------------------------------------------- render setup
-def setup_render(scene, out_dir, samples=192, motion_blur=True):
+def setup_render(scene, out_dir, samples=192, motion_blur=True, exposure=0.5, log=print):
     scene.render.engine = "CYCLES"
     try:
         cp = bpy.context.preferences.addons["cycles"].preferences
@@ -389,7 +389,26 @@ def setup_render(scene, out_dir, samples=192, motion_blur=True):
     scene.cycles.use_denoising = True
     scene.render.film_transparent = True
     scene.render.use_motion_blur = motion_blur
-    scene.render.motion_blur_shutter = 0.5
+    scene.render.motion_blur_shutter = exposure
+    # Match the plate's rolling shutter (solved readout, fraction of a frame). Cycles: the shutter window is
+    # readout + per-row exposure, each row exposed for rolling_shutter_duration of it, top row first.
+    rs = float(scene.get("cm_rolling_shutter", 0.0))
+    axis = scene.get("cm_rolling_shutter_axis", "rows")
+    try:
+        scene.cycles.rolling_shutter_type = "NONE"
+        if abs(rs) > 0.05:
+            if axis == "rows" and rs > 0:
+                scene.render.use_motion_blur = True
+                win = rs + (exposure if motion_blur else 0.02)
+                scene.render.motion_blur_shutter = win
+                scene.cycles.rolling_shutter_type = "TOP"
+                scene.cycles.rolling_shutter_duration = (exposure if motion_blur else 0.02) / win
+                log(f"render: rolling shutter {rs:.2f} frame (top first), shutter window {win:.2f}")
+            else:
+                log(f"render: plate rolling shutter {rs:+.2f} ({axis}) cannot be reproduced by Cycles "
+                    "(top-to-bottom rows only): CG rendered with a global shutter")
+    except AttributeError:
+        pass
     scene.view_settings.view_transform = "Standard"    # plate-consistent (sRGB in = sRGB out)
     scene.view_settings.look = "None"
     scene.render.resolution_percentage = 100

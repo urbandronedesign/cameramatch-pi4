@@ -16,10 +16,36 @@ import numpy as np
 import torch
 
 
+def _log_so3(R):
+    """Batched rotation matrix -> axis-angle vector."""
+    tr = (R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2] - 1) / 2
+    th = torch.arccos(torch.clamp(tr, -1 + 1e-12, 1 - 1e-12))
+    v = torch.stack([R[..., 2, 1] - R[..., 1, 2], R[..., 0, 2] - R[..., 2, 0], R[..., 1, 0] - R[..., 0, 1]], -1)
+    sc = torch.where(th[..., None] < 1e-6, torch.full_like(th[..., None], 0.5),
+                     th[..., None] / (2 * torch.sin(th[..., None]).clamp_min(1e-12)))
+    return v * sc
+
+
+def _project_rs(intr, w, C, X, R0, s, om, V, f0, cx, cy):
+    """Single observation with a rolling shutter. intr = (log f/f0, k1, k2, rs). The row's capture time is
+    s * rs frames from the frame's centre row (s = (v - cy) / H); the pose there follows the camera's
+    angular / linear velocity (om, V per frame, held fixed during one linearisation)."""
+    from refine import _expmap
+    f = f0 * torch.exp(intr[0])
+    t = s * intr[3]
+    R = _expmap(t * om) @ (_expmap(w) @ R0)
+    Xc = R @ (X - (C + t * V))
+    z = Xc[2]
+    x, y = Xc[0] / z, Xc[1] / z
+    r2 = x * x + y * y
+    d = 1 + intr[1] * r2 + intr[2] * r2 * r2
+    return torch.stack([f * x * d + cx, f * y * d + cy])
+
+
 class LMBA:
     def __init__(self, c2w, f0, plate, obs, X0, prior_sigma, device, focal_sigma=0.3, k_sigma=0.5,
-                 zoom=False, f_init=None, zoom_smooth=0.01, max_pairs_chunk=400_000, zoom_anchor="pi4"):
-        from refine import _project
+                 zoom=False, f_init=None, zoom_smooth=0.01, max_pairs_chunk=400_000, zoom_anchor="pi4",
+                 rolling_shutter=False, rs_sigma=1.0, rs_axis="auto"):
         self.dev = device
         self.T = c2w.shape[0]
         self.W, self.H = plate
@@ -31,6 +57,11 @@ class LMBA:
         self.focal_sigma = float(focal_sigma)
         self.k_sigma = float(k_sigma)
         self.zoom = bool(zoom)
+        self.rs_on = bool(rolling_shutter)
+        self.rs_sigma = float(rs_sigma) if self.rs_on else 1e-7     # locked at 0 when off
+        # readout direction: sensor rows = image rows (landscape), but a phone held upright (portrait video)
+        # reads out across the image columns
+        self.rs_axis = ("cols" if self.H > self.W else "rows") if rs_axis == "auto" else rs_axis
         self.zoom_smooth = float(zoom_smooth)
         self.chunk = int(max_pairs_chunk)
         T = self.T
@@ -44,9 +75,9 @@ class LMBA:
         else:
             lf = np.zeros(self.nf)
         self.logf_prior = torch.tensor(lf, dtype=torch.float64, device=device)
-        # camera-side layout: [k1, k2, logf (nf), w (T-1)x3, dC (T-1)x3] + 1 dummy column (fixed frame 0)
-        self.o_f = 2
-        self.o_w = 2 + self.nf
+        # camera-side layout: [k1, k2, rs, logf (nf), w (T-1)x3, dC (T-1)x3] + 1 dummy column (fixed frame 0)
+        self.o_f = 3
+        self.o_w = 3 + self.nf
         self.o_c = self.o_w + 3 * (T - 1)
         self.Nc = self.o_c + 3 * (T - 1)
         self.nP = X0.shape[0]
@@ -58,12 +89,15 @@ class LMBA:
         dist = np.linalg.norm(X0 - c2w[np.clip(first, 0, None), :3, 3], axis=1)
         self.X_sigma = torch.tensor(np.where(first >= 0, np.maximum(dist, 1e-3), 1.0), dtype=torch.float64,
                                     device=device)
-        self.x0 = dict(k=torch.zeros(2, dtype=torch.float64, device=device), logf=self.logf_prior.clone(),
+        self.x0 = dict(k=torch.zeros(3, dtype=torch.float64, device=device), logf=self.logf_prior.clone(),
                        w=torch.zeros(T, 3, dtype=torch.float64, device=device),
                        dC=torch.zeros(T, 3, dtype=torch.float64, device=device), X=self.X_init.clone())
-        jac = torch.func.jacfwd(_project, argnums=(0, 1, 2, 3))
-        self._jac = torch.func.vmap(jac, in_dims=(0, 0, 0, 0, 0, None, None, None))
-        self._proj = torch.func.vmap(_project, in_dims=(0, 0, 0, 0, 0, None, None, None))
+        jac = torch.func.jacfwd(_project_rs, argnums=(0, 1, 2, 3))
+        dims = (0, 0, 0, 0, 0, 0, 0, 0, None, None, None)
+        self._jac = torch.func.vmap(jac, in_dims=dims)
+        self._proj = torch.func.vmap(_project_rs, in_dims=dims)
+        self.om = torch.zeros(T, 3, dtype=torch.float64, device=device)
+        self.V = torch.zeros(T, 3, dtype=torch.float64, device=device)
         self.set_obs(obs)
 
     # ------------------------------------------------------------------ observations / structure
@@ -80,7 +114,11 @@ class LMBA:
         wc = torch.where(self.fr[:, None] > 0, self.o_w + 3 * fm1[:, None] + a3, self.Nc)
         cc = torch.where(self.fr[:, None] > 0, self.o_c + 3 * fm1[:, None] + a3, self.Nc)
         self.cols = torch.cat([fidx[:, None], torch.zeros_like(fidx)[:, None], torch.ones_like(fidx)[:, None],
-                               wc, cc], 1)                                           # (n, 9)
+                               torch.full_like(fidx, 2)[:, None], wc, cc], 1)       # (n, 10)
+        if self.rs_axis == "cols":
+            self.srow = (self.uv[:, 0] - self.cx) / self.W                          # column offset (x rs = frames)
+        else:
+            self.srow = (self.uv[:, 1] - self.cy) / self.H                          # row offset (x rs = frames)
         self.movable = (self.fr > 0).to(torch.float64)
         # all observation pairs sharing a point (for the Schur complement)
         so = torch.argsort(self.pt, stable=True)
@@ -96,20 +134,38 @@ class LMBA:
     # ------------------------------------------------------------------ model
     def _intr_obs(self, st):
         lf = st["logf"][self.fr] if self.zoom else st["logf"][0].expand(self.nobs)
-        return torch.stack([lf, st["k"][0].expand(self.nobs), st["k"][1].expand(self.nobs)], 1)
+        return torch.stack([lf, st["k"][0].expand(self.nobs), st["k"][1].expand(self.nobs),
+                            st["k"][2].expand(self.nobs)], 1)
+
+    def update_velocity(self, st):
+        """Per-frame angular / linear velocity (per frame step) from the neighbouring poses (central differences)."""
+        from refine import _expmap
+        T = self.T
+        if T < 2:
+            return
+        Rw = _expmap(st["w"]) @ self.R0
+        C = self._C(st)
+        nxt = torch.clamp(torch.arange(T, device=self.dev) + 1, max=T - 1)
+        prv = torch.clamp(torch.arange(T, device=self.dev) - 1, min=0)
+        dt = (nxt - prv).to(torch.float64)[:, None]
+        self.om = _log_so3(Rw[nxt] @ Rw[prv].transpose(1, 2)) / dt
+        self.V = (C[nxt] - C[prv]) / dt
+
+    def _args(self, st):
+        return (self._intr_obs(st), st["w"][self.fr], self._C(st)[self.fr], st["X"][self.pt], self.R0[self.fr],
+                self.srow, self.om[self.fr], self.V[self.fr], self.f0, self.cx, self.cy)
 
     def _C(self, st):
         return self.C0 + st["dC"]
 
     def _uv(self, st):
-        return self._proj(self._intr_obs(st), st["w"][self.fr], self._C(st)[self.fr], st["X"][self.pt],
-                          self.R0[self.fr], self.f0, self.cx, self.cy)
+        return self._proj(*self._args(st))
 
     def cost(self, st):
         r = (self._uv(st) - self.uv) * self.wsq[:, None]
         c = (r * r).sum()
         c = c + ((st["dC"][1:] / self.prior_sigma) ** 2).sum()
-        c = c + ((st["k"] / self.k_sigma) ** 2).sum()
+        c = c + ((st["k"][:2] / self.k_sigma) ** 2).sum() + (st["k"][2] / self.rs_sigma) ** 2
         c = c + (((st["logf"] - self.logf_prior) / self.focal_sigma) ** 2).sum()
         if self.zoom:
             c = c + (((st["logf"][1:] - st["logf"][:-1]) / self.zoom_smooth) ** 2).sum()
@@ -122,15 +178,13 @@ class LMBA:
     # ------------------------------------------------------------------ one LM linearisation
     def _linearise(self, st):
         n, N1 = self.nobs, self.Nc + 1
-        intr = self._intr_obs(st)
-        Ji, Jw, Jc, Jx = self._jac(intr, st["w"][self.fr], self._C(st)[self.fr], st["X"][self.pt],
-                                   self.R0[self.fr], self.f0, self.cx, self.cy)
+        args = self._args(st)
+        Ji, Jw, Jc, Jx = self._jac(*args)
         ws = self.wsq[:, None, None]
         mv = self.movable[:, None, None]
-        Jcam = torch.cat([Ji, Jw * mv, Jc * mv], 2) * ws                      # (n, 2, 9)
+        Jcam = torch.cat([Ji, Jw * mv, Jc * mv], 2) * ws                      # (n, 2, 10)
         Jp = Jx * ws                                                         # (n, 2, 3)
-        r = (self._proj(intr, st["w"][self.fr], self._C(st)[self.fr], st["X"][self.pt], self.R0[self.fr],
-                        self.f0, self.cx, self.cy) - self.uv) * self.wsq[:, None]
+        r = (self._proj(*args) - self.uv) * self.wsq[:, None]
         Hcc = torch.zeros(N1 * N1, dtype=torch.float64, device=self.dev)
         idx = (self.cols[:, :, None] * N1 + self.cols[:, None, :]).reshape(-1)
         Hcc.index_add_(0, idx, torch.einsum("nki,nkj->nij", Jcam, Jcam).reshape(-1))
@@ -151,7 +205,9 @@ class LMBA:
         dg[cidx] += 1 / self.prior_sigma ** 2
         gc[cidx] += st["dC"][1:].reshape(-1) / self.prior_sigma ** 2
         dg[0:2] += 1 / self.k_sigma ** 2
-        gc[0:2] += st["k"] / self.k_sigma ** 2
+        gc[0:2] += st["k"][:2] / self.k_sigma ** 2
+        dg[2] += 1 / self.rs_sigma ** 2
+        gc[2] += st["k"][2] / self.rs_sigma ** 2
         fidx = torch.arange(self.o_f, self.o_f + self.nf, device=self.dev)
         dg[fidx] += 1 / self.focal_sigma ** 2
         gc[fidx] += (st["logf"] - self.logf_prior) / self.focal_sigma ** 2
@@ -211,7 +267,7 @@ class LMBA:
         dC = st["dC"].clone()
         w[1:] += dc[self.o_w:self.o_c].view(T - 1, 3)
         dC[1:] += dc[self.o_c:self.Nc].view(T - 1, 3)
-        return dict(k=st["k"] + dc[0:2], logf=st["logf"] + dc[self.o_f:self.o_f + self.nf], w=w, dC=dC,
+        return dict(k=st["k"] + dc[0:3], logf=st["logf"] + dc[self.o_f:self.o_f + self.nf], w=w, dC=dC,
                     X=st["X"] + dp)
 
     def lm(self, st, max_iter=60, tol=1e-10):
@@ -256,11 +312,15 @@ class LMBA:
             else:
                 wgt = np.ones_like(e)
             self.wsq = torch.tensor(np.sqrt(wgt), dtype=torch.float64, device=self.dev)
+            if self.rs_on:
+                self.update_velocity(st)        # the row-time model uses the current camera motion
             st, _, k = self.lm(st, max_iter=max_nfev)
             iters += k
         self.wsq = torch.ones(self.nobs, dtype=torch.float64, device=self.dev)
+        rs_txt = f", rolling shutter {float(st['k'][2]):+.3f} frame ({self.rs_axis})" if self.rs_on else ""
         log(f"[refine] BA-LM ({loss}, {f_scale}px, IRLS x{irls_iters}): {self.nobs} obs, {self.nP} pts, "
-            f"{self.Nc} camera params{' (zoom)' if self.zoom else ''}, {len(self.pa)} Schur pairs, "
+            f"{self.Nc} camera params{' (zoom)' if self.zoom else ''}{rs_txt}, "
+            f"{len(self.pa)} Schur pairs, "
             f"{iters} LM iterations, {time.time() - t0:.1f}s")
         return st
 
@@ -275,3 +335,6 @@ class LMBA:
 
     def k12(self, st):
         return float(st["k"][0]), float(st["k"][1])
+
+    def readout(self, st):
+        return float(st["k"][2])

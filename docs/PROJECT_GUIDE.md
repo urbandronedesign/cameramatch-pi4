@@ -117,6 +117,7 @@ street walls are detected along the camera's travel direction, with no fixed +Y 
 | Solve Lens Distortion | on | **Turn off for slow or long-lens shots**: k1/k2 is poorly constrained and drags the focal |
 | Lock Focal to Pi4 | off | **Turn on for slow cinema shots** (sets focal_sigma to 0.002) |
 | Zoom Lens (Animate Focal) | off | Per-frame focal with a smoothness prior; the lens is keyframed |
+| Rolling Shutter | off | Solves the readout time (CMOS, fast handheld moves). Render & Comp matches it in Cycles |
 | Active Tracks | 600 | Tested sweet spot. More tracks make the solver slower without improving accuracy |
 | Max Frames / Stride / Model Resolution | 300 / 1 / 512 | GPU budget: 300 frames ≈ 12 GB, about 80 s |
 | Refine Matte After Solve | off | Runs the matte server automatically after a solve |
@@ -259,8 +260,15 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
   observations they are wildly over-confident (±0.08 % on a focal that can move 14 %).
 - **Zoom vs dolly, and focal vs distortion, are genuinely ambiguous on slow, low-parallax shots.** The tracks
   cannot decide, so the user picks the setting (Lock Focal, distortion off, Zoom Lens).
-- **Phone handheld is the weakest case** (likely rolling shutter). A rolling-shutter model would be the next
-  solver feature.
+- **Phone handheld is the weakest case, and the cause was not rolling shutter.** Residuals by image band showed
+  the tree canopy (71 % of the tracks) at 1.2–1.6 px against 0.65 px on the ground: the foliage moves. When a
+  shot underperforms, look at where the residuals are before adding a model.
+- **Rolling shutter:**
+  - the readout axis follows the sensor: portrait phone video reads across *columns*;
+  - Cycles' rolling shutter is top-to-bottom only, with the shutter window = readout + per-row exposure;
+  - the velocity comes from central differences, which under-read fast shake, so the readout comes out about
+    12 % high on the GT;
+  - holdout triangulation must use the same row-time poses, or it reports nonsense (3.4 px).
 - **Overlay tool:** the ground plane must be *below* the camera (otherwise a tree canopy wins), and points
   under Pi4's motion mask must be excluded (people drag the flow).
 
@@ -301,7 +309,8 @@ Most of the real bugs were caught this way.
   solved cameras would fix the set geometry there.
 - The robot is built from primitives. The next step in realism is a modelled, high-detail asset that
   keeps the same rig, lighting and composite.
-- Rolling-shutter model for phone footage (largest remaining error source on the hard-footage test).
+- Region masking / weighting for non-rigid areas (foliage, water): the largest remaining error source on the
+  hard-footage test.
 - Candidates: writing tracks into Blender's clip tracker, a metric-scale fix from a known measurement,
   a curved walk path (the robot button walks a straight line), and an "Insert Asset" button for any rigged
   character.

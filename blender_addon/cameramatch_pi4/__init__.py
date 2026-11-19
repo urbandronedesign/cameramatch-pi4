@@ -167,6 +167,10 @@ class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
     lock_focal: BoolProperty(name="Lock Focal to Pi4", default=False,
                              description="Hold the focal length at Pi4's estimate. Use on slow / low-parallax shots "
                                          "where the tracks cannot determine focal (keeps Pi4 depth consistent)")
+    rolling_shutter: BoolProperty(name="Rolling Shutter", default=False,
+                                  description="Solve the sensor readout time (CMOS video cameras, fast handheld "
+                                              "moves): each image row gets the pose at its capture time. Render & "
+                                              "Comp then renders the CG with the same rolling shutter")
     max_tracks: IntProperty(name="Active Tracks", default=600, min=50, max=5000,
                             description="Target number of simultaneously tracked features for refinement")
     auto_matte: BoolProperty(name="Refine Matte After Solve", default=False,
@@ -324,6 +328,8 @@ def import_result(scene, clip, job_dir, settings):
     # real-world scale (Set Scale from Distance writes scene_scale.json).
     sc_val = job_scale(job_dir)
     scene["cm_applied_scale"] = sc_val          # what this import really used (Set Scale works from it)
+    scene["cm_rolling_shutter"] = float(d["rolling_shutter"]) if "rolling_shutter" in d else 0.0
+    scene["cm_rolling_shutter_axis"] = str(d["rolling_shutter_axis"]) if "rolling_shutter_axis" in d else "rows"
     anchor = np.diag([sc_val, sc_val, sc_val, 1.0]) @ CV_TO_BL_WORLD @ np.linalg.inv(c2w[0])
     mats = [anchor @ c2w[i] @ CV_TO_BL_CAM for i in range(T)]
 
@@ -508,7 +514,8 @@ class CAMERAMATCH_OT_solve(bpy.types.Operator):
                        max_size=s.max_size - s.max_size % 16, track=s.track,
                        conf_threshold=s.conf_threshold, num_points=s.num_points,
                        refine=s.refine, max_tracks=s.max_tracks, solve_distortion=s.solve_distortion,
-                       focal_sigma=0.002 if s.lock_focal else 0.3, zoom=s.animate_focal, solver="lm")
+                       focal_sigma=0.002 if s.lock_focal else 0.3, zoom=s.animate_focal, solver="lm",
+                       rolling_shutter=s.rolling_shutter, rs_axis="auto")
         url = prefs.server_url.rstrip("/") + "/solve"
 
         def worker():
@@ -973,7 +980,7 @@ class CAMERAMATCH_OT_render_comp(bpy.types.Operator):
         clip = _main_clip(context)
         self.clip_name = clip.name if clip else "plate"
         render_dir = os.path.join(self.job_dir, "render")
-        set_builder.setup_render(sc, render_dir, s.render_samples, s.render_motion_blur)
+        set_builder.setup_render(sc, render_dir, s.render_samples, s.render_motion_blur, log=_log)
         self.frames = list(range(sc.frame_start, sc.frame_end + 1))
         self.fps = sc.render.fps / sc.render.fps_base
         self.phase = "render"
@@ -1114,6 +1121,7 @@ class CAMERAMATCH_PT_panel(bpy.types.Panel):
             layout.prop(s, "max_tracks")
             layout.prop(s, "solve_distortion")
             layout.prop(s, "lock_focal")
+            layout.prop(s, "rolling_shutter")
         layout.prop(s, "animate_focal")
         col = layout.column(align=True)
         col.prop(s, "conf_threshold")
