@@ -72,6 +72,11 @@ def ground_path(xy, heading_window=0.4):
     return path, float(s_arc[-1])
 
 
+def object_euler(ob):
+    """The object's own rotation as XYZ Euler, whatever its rotation mode (rotation_euler reads 0 in QUATERNION)."""
+    return ob.matrix_basis.to_3x3().normalized().to_euler("XYZ")
+
+
 def move_one(ob, path, length, floor_fn, scene, speed, yaw_off, z_off):
     """Keyframe one object (hierarchy root) along the path over the scene range at `speed` m/s, or with `speed`
     an array of arc-length positions per frame (walk-cycle speed profile): origin at
@@ -79,7 +84,7 @@ def move_one(ob, path, length, floor_fn, scene, speed, yaw_off, z_off):
     [(x, y, tangent_angle)] for collision bookkeeping."""
     f0, f1 = scene.frame_start, scene.frame_end
     fps = scene.render.fps / scene.render.fps_base
-    rx, ry = ob.rotation_euler.x, ob.rotation_euler.y
+    rx, ry = object_euler(ob)[:2]                   # whatever the rotation mode (glTF rigs come in quaternions)
     ob.rotation_mode = "XYZ"
     prev, track = None, []
     for fr in range(f0, f1 + 1):

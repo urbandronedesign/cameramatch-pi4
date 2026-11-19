@@ -346,6 +346,10 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
   the comp's pixels, and the add-on hides camera-enclosing objects from render (`hide_camera_blockers`).
 - Preview speed is per-frame overhead, not samples: 1.5 s/frame at 50 % / 24 samples, 1.1 s with persistent
   data, motion blur on or off the same.
+- Imported characters (v0.12.1): read rotations with `matrix_basis.to_euler()`, never `rotation_euler` (glTF
+  rigs are in quaternion mode, and a 90° axis tilt was silently lost). Importers leave one active NLA track per
+  animation and may key the armature object itself: Add Character clears both. Root-motion walks get an
+  in-place copy; non-walks are refused. Mixamo needs an Adobe login, so the tests use three.js' Mixamo exports.
 - Never block Blender's UI on HTTP: the engine light is fed by a background thread, and a 1 s app timer only
   redraws when the state text changes.
 
@@ -373,7 +377,6 @@ Most of the real bugs were caught this way.
 - Avoidance with waiting (time-based yielding) for passages too narrow to pass side by side.
 - A real-footage zoom test (only synthetic so far).
 - Publish the prebuilt images (GHCR) so `setup.ps1 -Pull` skips the 20–40 min build.
-- Mixamo FBX characters are handled in code (single imported action = the walk) but only tested on a glTF.
 
 ---
 

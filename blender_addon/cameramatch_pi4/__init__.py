@@ -1249,6 +1249,17 @@ class CAMERAMATCH_OT_move_along_path(bpy.types.Operator):
                 if arm is not None and (arm.animation_data or bpy.data.actions):
                     act = characters.walk_action(arm, self.action)
                     info = characters.analyse_walk(sc, r, arm, act)
+                    if info["hip_travel_m"] > 0.25:                     # an in-place cycle ends where it began
+                        # root motion (Mixamo walk without 'In Place'): walk on the spot, the path does the travel
+                        act = characters.make_in_place(act, info["hips"])
+                        _log(f"'{r.name}': '{act.name[:-8]}' moves its hips {info['hip_travel_m']:.2f} m per cycle by "
+                             f"itself (root motion): using an in-place copy '{act.name}'")
+                        info = characters.analyse_walk(sc, r, arm, act)
+                    if info["profile_mean_mpf"] * fps < 0.25:
+                        raise RuntimeError(
+                            f"'{act.name}' does not look like a walk cycle (its planted foot moves "
+                            f"{info['profile_mean_mpf'] * fps:.2f} m/s). Pick the walk in Walk Action, or download a "
+                            "Mixamo walk (FBX, With Skin, In Place ticked)")
                     v_cycle = info["profile_mean_mpf"] * fps
                     v = self.speed if self.speed > 0 else v_cycle
                     rate = v / max(v_cycle, 1e-9)                       # cycle playback follows the travel speed
@@ -1257,7 +1268,7 @@ class CAMERAMATCH_OT_move_along_path(bpy.types.Operator):
                     tr.strips[0].repeat = max(1.0, (sc.frame_end - sc.frame_start + 1) * rate / info["cycle"] + 1)
                     s_frames = characters.arc_positions(info, sc, rate)
                     fwd = info["forward"]
-                    yaw_off = r.rotation_euler.z - math.atan2(fwd[1], fwd[0])
+                    yaw_off = paths.object_euler(r).z - math.atan2(fwd[1], fwd[0])
                     z_off = info["sole_above"]
                     hw, hl = paths.footprint(r, fwd)
                     if info["root_motion"] > 0.5:
@@ -1271,7 +1282,8 @@ class CAMERAMATCH_OT_move_along_path(bpy.types.Operator):
                         if r.type != "EMPTY" else 0.0
                     z_off = -zmin
                     fl = -yaw_off                                       # local forward direction angle
-                    hw, hl = paths.footprint(r, (math.cos(fl + r.rotation_euler.z), math.sin(fl + r.rotation_euler.z)))
+                    rz = paths.object_euler(r).z
+                    hw, hl = paths.footprint(r, (math.cos(fl + rz), math.sin(fl + rz)))
                 P = pts
                 t_arr = np.arange(sc.frame_end - sc.frame_start + 1) / fps
                 if s_frames is None:                       # props: fixed speed, or the whole curve over the shot
@@ -1764,7 +1776,19 @@ def add_character(op, context, path):
         for c in list(o.users_collection):
             c.objects.unlink(o)
         coll.objects.link(o)
-    arm["cm_actions"] = [a.name for a in bpy.data.actions if a not in before_a]
+    new_acts = [a for a in bpy.data.actions if a not in before_a]
+    arm["cm_actions"] = [a.name for a in new_acts]
+    # importers leave one active NLA track per animation (they would all play at once under the walk) and may
+    # key the armature object's own transform: the add-on owns placement, the animation lives in the bones
+    ad = arm.animation_data
+    if ad is not None:
+        for t in list(ad.nla_tracks):
+            ad.nla_tracks.remove(t)
+        ad.action = None
+    n_obj = sum(characters.strip_object_transform(a) for a in new_acts)
+    if n_obj:
+        _log(f"'{arm.name}': removed {n_obj} object-transform channels from its actions (placement is set by the "
+             "add-on)")
     context.view_layer.update()
     meshes = [o for o in new if o.type == "MESH" and characters.hierarchy_root(o) is root]
     for o in new:                     # glTF files can ship stray helper meshes outside the rig: hide them

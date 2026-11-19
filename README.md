@@ -140,6 +140,34 @@ Advanced settings: *Refine at Plate Resolution* (default on), *Active Tracks* (6
 - Video decoded with OpenCV (H.264/H.265/MJPEG fine; ProRes may not be). TIFF/EXR sequences unsupported.
 - Upstream π⁴ is very new (released 2026-11-17); pinned to commit `32dfbea`.
 
+## Mixamo characters + engine start with Docker closed (v0.12.1)
+Tested with Mixamo rigs (`mixamorig:` bones, armature scale 0.01): three.js' Mixamo exports (`mixamo.fbx`,
+`Xbot.glb`, `Soldier.glb`) and two Mixamo-style FBX walks made from Xbot (`tests/make_mixamo_fbx.py`: In Place,
+and In Place unticked). `tests/check_mixamo.py` on the Venice set: Add Character, then Walk to Cursor 7 m.
+
+| File | Slide (planted foot, median) | Soles vs floor (median) | Facing error |
+|---|---|---|---|
+| Xbot (glTF) | 3.2 cm/s | −0.1 cm | 8° |
+| Soldier (glTF, tilted rig) | 1.8 cm/s | 0.0 cm | 7° |
+| Mixamo-style FBX, In Place | 3.0 cm/s | −0.2 cm | 8° |
+| Mixamo-style FBX, In Place unticked | 3.0 cm/s | −0.2 cm | 8° |
+| RobotExpressive (glTF) | 5.3 cm/s | −0.4 cm | 1° |
+
+Fixes found by these tests:
+- **Root motion** (a Mixamo walk downloaded without *In Place*): the hips' drift over the cycle is removed in an
+  in-place copy of the action, used automatically.
+- **Not a walk** (the planted foot moves < 0.25 m/s, e.g. `mixamo.fbx`'s dance): refused with a message saying
+  to pick the walk or download a Mixamo walk with In Place ticked.
+- **Tilted rigs** (Soldier's armature carries a 90° glTF axis rotation in quaternion mode): the path keyer read
+  `rotation_euler` (0 in quaternion mode) and dropped the tilt, so the walk played sideways (37 cm into the
+  floor, 151 cm/s slide). It now reads the object's real orientation.
+- **Importer leftovers:** Add Character removes the importer's per-animation NLA tracks (they all played at
+  once) and the actions' keys on the armature object's own transform.
+
+Docker closed (`tests/gui_engine_down.py`, real UI): Solve says *The engine is not running. Click Start Engine.*
+with a Start Engine button; Start Engine launches Docker Desktop and both containers, ready in 13 s; the Solve
+then succeeds.
+
 ## Ease of use (v0.12.0)
 - **setup.ps1:** one-command install with checks (WSL2, GPU and driver, Docker and its data drive's free space,
   Blender), engine build or download (`-Pull`), first start, add-on install and configuration. Maintainers
@@ -481,6 +509,8 @@ Solve: *Solve Lens Distortion* off, *Lock Focal to Pi4* on -> 0.35 px median, f 
 ```
 blender --python tests/gui_guided.py -- <footage.mp4> <character.glb> <out_dir> [max_frames]  # whole guided flow, real UI
 blender -b <scene with set + CM_path>.blend --python tests/check_offfloor.py      # paths drawn into walls
+blender -b <scene with CM_Set>.blend --python tests/check_mixamo.py -- <char.fbx|glb> <out> [not_walk]
+blender --python tests/gui_engine_down.py -- <footage.mp4> <out>   # quit Docker Desktop first
 blender -b --factory-startup --python tests/blender_smoke.py                    # import/axes, no server
 blender -b --factory-startup --python tests/blender_e2e.py -- <video|first_png>  # full chain
 # Synthetic ground truth:

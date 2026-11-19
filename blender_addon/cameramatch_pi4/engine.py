@@ -67,7 +67,7 @@ def summary():
         gpu = STATE["gpu"].replace("NVIDIA GeForce ", "")
         return "CHECKMARK", f"Engine ready ({gpu})" + (" - working" if "busy" in (p, m) else "")
     if p == "down" and m == "down":
-        return "CANCEL", "Engine not running"
+        return "CANCEL", "Engine off"
     if p in ("starting", "loading"):
         return "SORTTIME", "Engine starting: loading the Pi4 model..."
     if p == "error":

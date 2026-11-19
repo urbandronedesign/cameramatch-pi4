@@ -141,7 +141,75 @@ def analyse_walk(scene, root, arm, action):
     # swing foot that dips below the planted one in stylised cycles and leave the planted foot hovering)
     return dict(speed_mpf=speed, forward=fwd, sole_above=float(root.matrix_world.translation.z - np.median(sole)),
                 cycle=cycle, root_motion=root_motion, feet=feet, action=action.name, profile=prof,
-                profile_step=hstep, profile_mean_mpf=float(prof.mean()))
+                profile_step=hstep, profile_mean_mpf=float(prof.mean()), hips=hips,
+                hip_travel_m=float(np.linalg.norm(Hp[-1, :2] - Hp[0, :2])))
+
+
+def _fcurves(action):
+    """All F-curves of an action (Blender 5 layered actions: layers > strips > channelbags)."""
+    if hasattr(action, "fcurves"):
+        return list(action.fcurves)
+    out = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            for cb in getattr(strip, "channelbags", []):
+                out += list(cb.fcurves)
+    return out
+
+
+OBJECT_TRANSFORM = ("location", "rotation_quaternion", "rotation_euler", "rotation_axis_angle", "scale",
+                    "delta_location", "delta_rotation_euler", "delta_rotation_quaternion", "delta_scale")
+
+
+def strip_object_transform(action):
+    """Remove an action's keys on the OBJECT's own transform (glTF exporters key the armature node: e.g. three.js'
+    Soldier). Placement belongs to Move Along Path; left in, they fight its keys and undo the character's scale.
+    Bone animation (pose.bones[...]) is kept. Returns how many F-curves were removed."""
+    n = 0
+    if hasattr(action, "fcurves"):
+        for fc in [f for f in action.fcurves if f.data_path in OBJECT_TRANSFORM]:
+            action.fcurves.remove(fc)
+            n += 1
+        return n
+    for layer in action.layers:
+        for strip in layer.strips:
+            for cb in getattr(strip, "channelbags", []):
+                for fc in [f for f in cb.fcurves if f.data_path in OBJECT_TRANSFORM]:
+                    cb.fcurves.remove(fc)
+                    n += 1
+    return n
+
+
+def make_in_place(action, hips):
+    """Copy of a walk with ROOT MOTION (e.g. a Mixamo walk downloaded without 'In Place') where the hips no
+    longer travel: the linear drift of the hips' location over the cycle is removed, so the cycle loops on the
+    spot and Move Along Path does the travelling. Returns the copy ('<name>_inplace')."""
+    name = f"{action.name}_inplace"
+    old = bpy.data.actions.get(name)
+    if old is not None:
+        bpy.data.actions.remove(old)
+    new = action.copy()
+    new.name = name
+    path = f'pose.bones["{hips}"].location'
+    n = 0
+    for fc in _fcurves(new):
+        if fc.data_path != path or len(fc.keyframe_points) < 2:
+            continue
+        kp = fc.keyframe_points
+        t0, t1 = kp[0].co.x, kp[-1].co.x
+        d = kp[-1].co.y - kp[0].co.y
+        if abs(t1 - t0) < 1e-6:
+            continue
+        for k in kp:
+            u = (k.co.x - t0) / (t1 - t0)
+            k.co.y -= d * u
+            k.handle_left.y -= d * u
+            k.handle_right.y -= d * u
+        fc.update()
+        n += 1
+    if n == 0:
+        raise RuntimeError(f"'{action.name}': no location keys on '{hips}' to remove the root motion from")
+    return new
 
 
 def loop_action(scene, arm, action):
