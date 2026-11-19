@@ -8,7 +8,7 @@ Camera matching for Blender in two stages:
    3D points initialised from π⁴ (triangulation, falling back to π⁴ depth), then robust bundle adjustment
    of every pose, every point, one focal length and k1/k2 radial distortion (Blender *Polynomial* model).
 
-> **License:** this add-on is GPL-3.0. The π⁴ code and weights are **CC BY-NC 4.0,
+> **License:** this add-on is GPL-3.0. OneFormer (semantic masks) is MIT-licensed, pulled into the Docker image. The π⁴ code and weights are **CC BY-NC 4.0,
 > non-commercial only**. They are pulled into the Docker image, never bundled with the add-on.
 
 ## Accuracy (synthetic ground truth, 1920×1080, 120 frames, 24 mm, k1 −0.08 / k2 0.02)
@@ -114,6 +114,30 @@ every frame), for inspection or Blender's own solver. On Venice: 1169 tracks, 16
 from the solved projection.
 
 Checks: `blender -b <solved.blend> --python tests/check_robust_features.py -- [zoom_job first_png gt.json]`.
+
+## Ignore trees / water / sky (v0.8.0, on by default)
+Leaves in the wind, waves and clouds are not static, yet they can supply most of the trackable corners. They
+then pull the camera solve, and because they are the majority, no outlier rule can reject them. *Ignore
+Trees / Water / Sky* runs **OneFormer** (ADE20K, Swin-Tiny, `shi-labs/oneformer_ade20k_swin_tiny`, MIT
+license) on every 5th frame. It masks tree, plant, palm, flower, water, sea, river, waterfall, fountain, sky and
+flag, dilated by 2 px, and adds the mask to Pi4's moving-object mask, so no track starts there. The cost is about
+7 s per solve with the model cached (25 s on the first load).
+
+| Shot (holdout = 15 % of tracks kept out) | masked | median | holdout median / p90 |
+|---|---|---|---|
+| Park path, phone (distortion off) | 64.5 % (tree 61 %) | 0.858 → **0.401 px** | 1.558 → **0.450** / 6.37 → **1.30 px** |
+| ToS balcony at night | 11 % (sky, sea) | 0.361 → **0.321 px** | 0.521 → **0.478** / 3.80 → **1.85 px** |
+| Venice alley | 1.4 % (sky) | 0.349 → 0.339 px | 0.415 → 0.392 px |
+| Japan crowd / students / synthetic GT | 0–3 % | unchanged | unchanged (within noise) |
+
+On the park path, the ground-grid drift halves (0.161 → 0.073 px/frame, median 13.8 → 5.4 px), and the ground
+plane holds 50 % of the points instead of 15 %: with the leaves gone, the solve sees the ground.
+When more than half of the frame is masked, the log suggests turning *Solve Lens Distortion* off. Distortion
+needs tracks across the whole frame: with the canopy removed and distortion on, k1/k2 ran away to 0.87 / −1.2.
+
+*Rejected:* detecting non-rigid tracks from their residuals, either the temporal structure (smoothed/raw ratio
+≈ 0.8 on every shot, rigid or not) or a spatially pooled score. On clean shots the natural residual spread
+(3.2× from p10 to p90 on the synthetic GT) is larger than the foliage/ground difference (2×).
 
 ## Rolling shutter (v0.7.0)
 *Rolling Shutter* (Pi4 tab, refine options) solves the sensor readout time as one global value: a signed

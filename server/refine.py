@@ -363,7 +363,7 @@ def _stats(e):
 
 def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nfev=50, quality=0.001,
            focal_sigma=0.3, progress=None, solve_distortion=True, solver="lm", zoom=False, zoom_smooth=0.01,
-           zoom_anchor="pi4", holdout_frac=0.0, rolling_shutter=False, rs_axis="auto"):
+           zoom_anchor="pi4", holdout_frac=0.0, rolling_shutter=False, rs_axis="auto", ignore_classes=None):
     """result: dict from result.npz; cache: dict(depth [T,Hm,Wm] metric, dyn [T,Hm,Wm]).
     progress(stage, frac, msg) is called with stages 'klt' and 'ba'.
     solver: "lm" (GPU Levenberg-Marquardt + Schur complement, ba_lm.py) or "scipy" (TRF + LSMR, class BA).
@@ -371,6 +371,9 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
     rolling_shutter: solve a sensor readout time (fraction of a frame step, signed: + = top row first), the
     pose of each row following the camera's motion (phones, most CMOS video cameras). LM solver only.
     rs_axis: "rows", "cols" or "auto" (cols for portrait video: an upright phone reads out across columns).
+    ignore_classes: semantic classes (ADE20K names, e.g. semantic.DEFAULT_CLASSES: trees, water, sky...) whose
+    pixels are never tracked, added to Pi4's moving-object mask. Residual-based detection of non-rigid tracks
+    was tried and rejected: on clean shots the natural residual spread exceeds the foliage/ground difference.
     holdout_frac: keep that fraction of tracks out of the solve and report their error. This measures the
     solve's self-consistency, NOT its correctness: on the synthetic GT a wrong lens model (no k1/k2, focal
     17% off, 2.6 deg rotation error) predicts held-out tracks as well as the right one, so it cannot be used
@@ -383,6 +386,17 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
     Wm, Hm = (int(v) for v in result["model_size"])
     depth, dyn = cache["depth"].astype(np.float32), cache["dyn"].astype(np.float32) / 255.0
 
+    sem_info = None
+    if ignore_classes:
+        import semantic
+        prog("klt", 0.0, "semantic masks (trees, water, sky)")
+        sem, frac = semantic.masks(src, result["frame_indices"], (Wm, Hm), classes=tuple(ignore_classes), log=log,
+                                   progress=lambda fr, msg: prog("klt", 0.1 * fr, msg))
+        dyn = np.maximum(dyn, sem.astype(np.float32))
+        sem_info = dict(masked_pct=float(100 * sem.mean()), classes={k: round(100 * v, 1) for k, v in frac.items()})
+        if sem.mean() > 0.5:
+            log(f"[refine] {100 * sem.mean():.0f}% of the image is masked: the remaining tracks are concentrated, "
+                "consider Solve Lens Distortion off (distortion needs tracks across the frame)")
     obs, colors, plate = klt_tracks(src, result["frame_indices"], dyn, max_active=max_active, quality=quality,
                                     log=log, progress=progress)
     obs_full = obs.copy()  # every KLT observation (exported to Blender's tracker for the kept tracks)
@@ -529,6 +543,11 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
         return out, stats
 
     split = None
+    def finish(out, stats):
+        if sem_info:
+            stats["semantic"] = sem_info
+        return out, stats
+
     if holdout_frac > 0:
         rng = np.random.default_rng(12345)
         tids = np.unique(obs_all[:, 1].astype(np.int64))
@@ -540,5 +559,6 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
     else:
         out, stats = run(obs_all, solve_distortion)
     prog("ba", 1.0, "bundle adjustment done")
+    out, stats = finish(out, stats)
     return out, stats
 

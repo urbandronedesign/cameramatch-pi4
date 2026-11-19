@@ -222,6 +222,17 @@ def solve(req):
     return summary
 
 
+def _ignore_classes(req):
+    """Request field ignore_classes: list of ADE20K names, or true / "default" for semantic.DEFAULT_CLASSES."""
+    v = req.get("ignore_classes")
+    if not v:
+        return None
+    if v is True or v == "default":
+        import semantic
+        return list(semantic.DEFAULT_CLASSES)
+    return list(v)
+
+
 def run_refine(req, started=False):
     """Plate-resolution KLT + bundle adjustment on top of an existing Pi4 result."""
     import refine as rf
@@ -247,7 +258,8 @@ def run_refine(req, started=False):
                            solver=str(req.get("solver", "lm")), zoom=bool(req.get("zoom", False)),
                            zoom_smooth=float(req.get("zoom_smooth", 0.01)),
                            rolling_shutter=bool(req.get("rolling_shutter", False)),
-                           rs_axis=str(req.get("rs_axis", "auto")))
+                           rs_axis=str(req.get("rs_axis", "auto")),
+                           ignore_classes=_ignore_classes(req))
     PROGRESS.update(job, "write", 0.5, "writing result")
     result.update(out)
     np.savez(res_path, **result)

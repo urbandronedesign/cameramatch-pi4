@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--holdout", type=float, default=0.0, help="fraction of tracks kept out (camera-only check)")
     ap.add_argument("--rolling-shutter", action="store_true")
     ap.add_argument("--rs-axis", default="auto")
+    ap.add_argument("--ignore", default="", help="semantic classes to mask, 'default' = semantic.DEFAULT_CLASSES")
     ap.add_argument("--no-distortion", action="store_true")
     ap.add_argument("--focal-sigma", type=float, default=0.3)
     a = ap.parse_args()
@@ -75,7 +76,9 @@ def main():
                             max_active=a.tracks, focal_sigma=a.focal_sigma,
                             solve_distortion=not a.no_distortion, solver=solver, zoom=a.zoom,
                             zoom_smooth=a.zoom_smooth, zoom_anchor=a.zoom_anchor, holdout_frac=a.holdout,
-                            rolling_shutter=a.rolling_shutter, rs_axis=a.rs_axis)
+                            rolling_shutter=a.rolling_shutter, rs_axis=a.rs_axis,
+                            ignore_classes=(__import__("semantic").DEFAULT_CLASSES if a.ignore == "default"
+                                            else [c for c in a.ignore.split(",") if c]) or None)
         tot = time.time() - t0
         ba_s = sum(float(l.split("evals, " if "evals" in l else "iterations, ")[1].rstrip("s"))
                    for l in lines if l.startswith("[refine] BA"))
@@ -83,7 +86,8 @@ def main():
         row = dict(cam_travel=round(float(np.linalg.norm(C[-1] - C[0])), 4), total_s=round(tot, 1), ba_s=round(ba_s, 1), median_px=round(st["final"]["median"], 4),
                    p90_px=round(st["final"]["p90"], 4), f_px=round(st["f_px"], 2),
                    f_range=[round(v, 1) for v in st["f_px_range"]], k1=round(st["k1"], 5), k2=round(st["k2"], 5),
-                   obs=st["observations"], tracks=st["tracks"], readout=round(st.get("rolling_shutter", 0.0), 4))
+                   obs=st["observations"], tracks=st["tracks"], readout=round(st.get("rolling_shutter", 0.0), 4),
+                   masked_pct=round(st.get("semantic", {}).get("masked_pct", 0.0), 1))
         if "holdout" in st:
             row.update(holdout_med_px=round(st["holdout"]["median"], 3), holdout_p90_px=round(st["holdout"]["p90"], 3),
                        holdout_tracks=st["holdout"]["tracks"])
@@ -92,6 +96,16 @@ def main():
         rows[solver] = row
         print(f"== {solver}: {json.dumps(row)}", flush=True)
     print("SUMMARY", json.dumps(rows, indent=1))
+    if os.environ.get("CM_BENCH_SAVE"):                        # write the last solve as a job copy (for overlays)
+        dst = os.environ["CM_BENCH_SAVE"]
+        os.makedirs(dst, exist_ok=True)
+        r2 = dict(result)
+        r2.update(out)
+        np.savez(os.path.join(dst, "result.npz"), **r2)
+        import shutil
+        shutil.copy(os.path.join(a.job, "pi4_cache.npz"), os.path.join(dst, "pi4_cache.npz"))
+        if os.path.isdir(os.path.join(a.job, "input")) and not os.path.isdir(os.path.join(dst, "input")):
+            shutil.copytree(os.path.join(a.job, "input"), os.path.join(dst, "input"))
 
 
 if __name__ == "__main__":

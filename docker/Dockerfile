@@ -29,6 +29,8 @@ RUN git clone https://github.com/yyfz/Pi4 /opt/Pi4 \
 RUN cd /opt/Pi4 && uv pip install --no-build-isolation -e ".[example]"
 # Phase 2 refinement (bundle adjustment).
 RUN uv pip install "scipy>=1.14"
+# OneFormer (ADE20K) semantic masks: trees / water / sky excluded from camera tracking (server/semantic.py)
+RUN uv pip install "transformers==5.23.0"
 
 COPY server /app
 WORKDIR /app

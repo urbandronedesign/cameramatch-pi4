@@ -171,6 +171,10 @@ class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
                                   description="Solve the sensor readout time (CMOS video cameras, fast handheld "
                                               "moves): each image row gets the pose at its capture time. Render & "
                                               "Comp then renders the CG with the same rolling shutter")
+    ignore_nonrigid: BoolProperty(name="Ignore Trees / Water / Sky", default=True,
+                                  description="Never track features on trees, plants, water or sky (OneFormer "
+                                              "semantic masks, MIT): leaves in the wind, waves and clouds are not "
+                                              "static and pull the camera solve. About 25 s extra")
     max_tracks: IntProperty(name="Active Tracks", default=600, min=50, max=5000,
                             description="Target number of simultaneously tracked features for refinement")
     auto_matte: BoolProperty(name="Refine Matte After Solve", default=False,
@@ -515,7 +519,7 @@ class CAMERAMATCH_OT_solve(bpy.types.Operator):
                        conf_threshold=s.conf_threshold, num_points=s.num_points,
                        refine=s.refine, max_tracks=s.max_tracks, solve_distortion=s.solve_distortion,
                        focal_sigma=0.002 if s.lock_focal else 0.3, zoom=s.animate_focal, solver="lm",
-                       rolling_shutter=s.rolling_shutter, rs_axis="auto")
+                       rolling_shutter=s.rolling_shutter, rs_axis="auto", ignore_classes=bool(s.ignore_nonrigid))
         url = prefs.server_url.rstrip("/") + "/solve"
 
         def worker():
@@ -1122,6 +1126,7 @@ class CAMERAMATCH_PT_panel(bpy.types.Panel):
             layout.prop(s, "solve_distortion")
             layout.prop(s, "lock_focal")
             layout.prop(s, "rolling_shutter")
+            layout.prop(s, "ignore_nonrigid")
         layout.prop(s, "animate_focal")
         col = layout.column(align=True)
         col.prop(s, "conf_threshold")
