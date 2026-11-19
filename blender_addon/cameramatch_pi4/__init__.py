@@ -7,6 +7,7 @@ only copies the clip to the shared work folder, calls the server over HTTP and
 imports result.npz.
 """
 import json
+import math
 import os
 import re
 import shutil
@@ -19,9 +20,9 @@ import urllib.request
 import bpy
 import numpy as np
 from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 
-from . import ignore_mask, paths, robot, set_builder
+from . import characters, collide, ignore_mask, paths, robot, set_builder
 
 # The work folder is the repo's ./work, mounted as /work by docker-compose. Set it in the add-on preferences,
 # or with the CAMERAMATCH_WORK environment variable.
@@ -194,6 +195,9 @@ class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
     set_tris: IntProperty(name="Set Triangles", default=60000, min=5000, max=500000)
     robot_speed: FloatProperty(name="Walk Speed", default=0.85, min=0.2, max=2.0, unit="VELOCITY",
                                description="Capped so the robot stops 3 m short of the camera")
+    avoid_collisions: BoolProperty(name="Avoid Collisions", default=True,
+                                   description="Robot / Move Along Path bend their path around the set's walls, "
+                                               "static CG objects and earlier robots / moved objects")
     robot_look: BoolProperty(name="Look at Camera", default=True,
                              description="The robot turns its head to the camera in the last third of the shot")
     render_samples: IntProperty(name="Samples", default=192, min=1, max=4096)
@@ -888,9 +892,21 @@ class CAMERAMATCH_OT_add_robot(bpy.types.Operator):
         _log("===== Add Walking Robot " + (f"along curve '{crv.name}'" if crv else
                                             f"from cursor {tuple(round(x, 2) for x in sc.cursor.location)}") + " =====")
         try:
+            fz = lambda x, y: set_builder.floor_z(sc, x, y)  # noqa: E731
             pxy = paths.curve_points(crv)[:, :2] if crv else None
-            robot.add_walking_robot(sc, sc.cursor.location.copy(), lambda x, y: set_builder.floor_z(sc, x, y),
-                                    _log, speed=s.robot_speed, look_at_camera=s.robot_look, path_xy=pxy)
+            avoid_fn = None
+            if s.avoid_collisions:
+                kd, n_obs = collide.obstacle_tree(sc, fz)
+
+                def avoid_fn(P, v):
+                    P2, dmin, gap = collide.avoid(P, v, sc, 0.3, 0.3, kd, log=_log)
+                    _log(f"collision avoidance: {n_obs} wall/object samples, closest wall {dmin:.2f} m, "
+                         f"closest mover gap {gap if gap < 1e9 else float('inf'):.2f} m")
+                    return P2
+            coll, _, track, pelvis = robot.add_walking_robot(
+                sc, sc.cursor.location.copy(), fz, _log, speed=s.robot_speed, look_at_camera=s.robot_look,
+                path_xy=pxy, avoid_fn=avoid_fn)
+            collide.register_mover(sc, pelvis.name, sc.frame_start, track, 0.3, 0.3)
         except Exception as e:
             self.report({"ERROR"}, f"Add robot failed: {e}")
             return {"CANCELLED"}
@@ -1039,7 +1055,12 @@ class CAMERAMATCH_OT_move_along_path(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     speed: FloatProperty(name="Speed", default=0.0, min=0.0, max=100.0, unit="VELOCITY",
-                         description="Metres per second (0 = the whole curve over the frame range)")
+                         description="Metres per second. 0 = the whole curve over the frame range (props), or the "
+                                     "walk cycle's own speed (characters). For characters a set speed scales the "
+                                     "cycle's playback so the feet stay planted")
+    action: StringProperty(name="Walk Action", default="",
+                           description="Character walk cycle (empty: the action named like 'walk', else the "
+                                       "active one)")
     forward: bpy.props.EnumProperty(name="Forward Axis", default="-Y",
                                     items=[("-Y", "-Y", "Blender character convention"), ("+Y", "+Y", ""),
                                            ("+X", "+X", ""), ("-X", "-X", "")],
@@ -1053,19 +1074,99 @@ class CAMERAMATCH_OT_move_along_path(bpy.types.Operator):
 
     def execute(self, context):
         sc = context.scene
+        s = sc.cameramatch
         crv = context.active_object
-        sel = [o for o in context.selected_objects if o is not crv]
-        objs = [o for o in sel if o.parent not in sel]            # move the top of each hierarchy only
+        fz = lambda x, y: set_builder.floor_z(sc, x, y)  # noqa: E731
+        fps = sc.render.fps / sc.render.fps_base
+        dur = max((sc.frame_end - sc.frame_start) / fps, 1e-3)
+        roots = []
+        for o in context.selected_objects:
+            if o is not crv:
+                r = characters.hierarchy_root(o)
+                if r not in roots and r is not crv:
+                    roots.append(r)
+        msgs = []
         try:
-            pts = paths.curve_points(crv)
-            path, length = paths.ground_path(pts[:, :2])
-            v = paths.move_along(objs, path, length, lambda x, y: set_builder.floor_z(sc, x, y), sc,
-                                 self.speed, self.forward, log=_log)
+            pts = paths.curve_points(crv)[:, :2]
+            _, L0 = paths.ground_path(pts)
+            kd = None
+            if s.avoid_collisions:
+                excl = set()
+                for r in roots:
+                    stack = [r]
+                    while stack:
+                        o = stack.pop()
+                        excl.add(o.name)
+                        stack.extend(o.children)
+                kd, n_obs = collide.obstacle_tree(sc, fz, exclude=excl)
+            for r in roots:
+                arm = characters.find_armature(r)
+                info = None
+                if arm is not None and (arm.animation_data or bpy.data.actions):
+                    act = characters.walk_action(arm, self.action)
+                    info = characters.analyse_walk(sc, r, arm, act)
+                    v_cycle = info["profile_mean_mpf"] * fps
+                    v = self.speed if self.speed > 0 else v_cycle
+                    rate = v / max(v_cycle, 1e-9)                       # cycle playback follows the travel speed
+                    tr = characters.loop_action(sc, arm, act)
+                    tr.strips[0].scale = 1.0 / rate
+                    tr.strips[0].repeat = max(1.0, (sc.frame_end - sc.frame_start + 1) * rate / info["cycle"] + 1)
+                    s_frames = characters.arc_positions(info, sc, rate)
+                    fwd = info["forward"]
+                    yaw_off = r.rotation_euler.z - math.atan2(fwd[1], fwd[0])
+                    z_off = info["sole_above"]
+                    hw, hl = paths.footprint(r, fwd)
+                    if info["root_motion"] > 0.5:
+                        _log(f"warning: '{act.name}' moves its hips forward by itself (root motion "
+                             f"{info['root_motion'] * 100:.0f}%): use an in-place walk cycle")
+                else:
+                    v = self.speed if self.speed > 0 else L0 / dur
+                    s_frames = None
+                    yaw_off = paths.FORWARD_YAW[self.forward]
+                    zmin = min((r.matrix_basis.to_3x3() @ Vector(c)).z for c in r.bound_box) \
+                        if r.type != "EMPTY" else 0.0
+                    z_off = -zmin
+                    fl = -yaw_off                                       # local forward direction angle
+                    hw, hl = paths.footprint(r, (math.cos(fl + r.rotation_euler.z), math.sin(fl + r.rotation_euler.z)))
+                P = pts
+                t_arr = np.arange(sc.frame_end - sc.frame_start + 1) / fps
+                if s_frames is None:                       # props: fixed speed, or the whole curve over the shot
+                    rule = (lambda L, v_=self.speed: np.minimum(v_ * t_arr, L)) if self.speed > 0 else \
+                        (lambda L: np.minimum(L / dur * t_arr, L))
+                else:
+                    rule = s_frames
+                if kd is not None or collide.movers(sc):
+                    P, dmin, gap = collide.avoid(pts, rule, sc, hw, hl, kd, self_name=r.name, log=_log)
+                    _log(f"'{r.name}': closest wall {dmin:.2f} m, closest mover gap "
+                         f"{gap if gap < 1e9 else float('inf'):.2f} m")
+                path, length = paths.ground_path(P)
+                if v * dur > length + 0.05:
+                    _log(f"warning: '{r.name}' reaches the end of the curve after {length / v:.1f} s "
+                         f"(shot {dur:.1f} s): extend the curve")
+                track = paths.move_one(r, path, length, fz, sc, rule(length) if callable(rule) else rule,
+                                       yaw_off, z_off)
+                arrival = sc.frame_end
+                if s_frames is not None and s_frames[-1] > length:
+                    arrival = sc.frame_start + int(np.searchsorted(s_frames, length))
+                    idle = characters.finish_at(sc, arm, tr, info, rate, arrival)
+                    _log(f"'{r.name}' arrives at frame {arrival}: walk cycle ends there"
+                         + (f", then '{idle}'" if idle else " (last pose held)"))
+                collide.register_mover(sc, r.name, sc.frame_start, track, hw, hl)
+                msg = f"'{r.name}' {length:.1f} m at {v:.2f} m/s"
+                if info is not None:
+                    sl = characters.foot_slide(sc, arm, info["feet"], f1=arrival)
+                    msg += (f", walk '{info['action']}' {info['profile_mean_mpf'] * fps:.2f} m/s, "
+                            f"planted-foot slide {sl['median_cm_s']:.1f} cm/s median")
+                _log(msg)
+                msgs.append(msg)
         except Exception as e:
+            import traceback
+            _log("Move Along Path failed: " + traceback.format_exc().replace(chr(10), " | "))
+            _sync_log_text()
             self.report({"ERROR"}, f"Move Along Path failed: {e}")
             return {"CANCELLED"}
         _sync_log_text()
-        self.report({"INFO"}, f"{len(objs)} object(s) along '{crv.name}' ({length:.1f} m) at {v:.2f} m/s")
+        self.report({"INFO"}, "; ".join(msgs))
         return {"FINISHED"}
 
 
@@ -1219,6 +1320,7 @@ def draw_cg_box(layout, s):
     col = box.column(align=True)
     col.prop(s, "robot_speed")
     col.prop(s, "robot_look")
+    col.prop(s, "avoid_collisions")
     col = box.column(align=True)
     col.prop(s, "render_samples")
     col.prop(s, "render_motion_blur")

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "cameramatch_pi4"
-version = "0.10.0"
+version = "0.11.0"
 name = "CameraMatch Pi4"
 tagline = "Automatic camera solve from a movie clip using the Pi4 model"
 maintainer = "CameraMatch contributors"

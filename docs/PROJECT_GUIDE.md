@@ -56,6 +56,9 @@ matte (tools)        on demand        docker compose --profile tools run --rm ma
 | `work/` | Job folders (`<clip>_<date>_<time>/`) and per-shot outputs |
 | `samples/` | Source clips. The full Tears of Steel film is in `samples/tos/` |
 
+**Avoidance and characters (v0.11.0):** `collide.py` (obstacle KD-tree, mover registry `scene["cm_movers"]`,
+lateral-offset avoidance) and `characters.py` (walk-cycle analysis, NLA looping, arrival, foot-slide metric).
+
 **Workflow tools (v0.10.0):**
 - **Re-solve (Refine Only):** calls `/refine` with `_refine_settings()`, the same dict Solve uses, so the
   two can't drift apart, then re-imports.
@@ -276,6 +279,14 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
 - **Non-rigid regions (foliage, water, clouds):** they can be the majority of tracks, so robust statistics
   can't remove them, and residual-based detection failed. The rigid-shot spread is larger than the foliage
   signal. What works is the **semantic** mask (OneFormer). After masking a large area, turn distortion off.
+- **Walking characters:** drive the root with the cycle's planted-foot speed **profile**, not its average
+  (63 → 5 cm/s slide). Sample the cycle at its true fractional length: Walking is 23.958 frames, and an
+  integer cycle drifts a frame per loop. Take the heading over ±0.4 m of arc length, because jitter swings
+  a planted foot that sits beside the root. Use the median sole height, because stylised cycles dip the
+  swing foot below the planted one. Stop the cycle when the path ends.
+- **Avoidance:** iterative push-and-smooth fought itself (heavy smoothing erased each detour). Direct
+  lateral line search per conflict, combined with max, converges in 2–3 passes. Elongated movers clear walls
+  by their half-width (walls run alongside), not their length. Wall samples must be dense (along edges).
 - **Masks in Blender:**
   - mask space is normalised 0–1 on both axes, y up, regardless of aspect;
   - layer shape keys (animation) are operator-only, not editable as data, so evaluate masks through the
@@ -329,8 +340,7 @@ Most of the real bugs were caught this way.
   solved cameras would fix the set geometry there.
 - The robot is built from primitives. The next step in realism is a modelled, high-detail asset that
   keeps the same rig, lighting and composite.
-- Robot / Move Along Path: avoid the set walls and other CG (no collision handling yet); foot-locked walk
-  cycles for imported characters (Move Along Path slides an in-place cycle at constant speed).
+- Avoidance with waiting (time-based yielding) for passages too narrow to pass side by side.
 - A real-footage zoom test (only synthetic so far).
 - Candidates: writing tracks into Blender's clip tracker, a metric-scale fix from a known measurement,
   a curved walk path (the robot button walks a straight line), and an "Insert Asset" button for any rigged

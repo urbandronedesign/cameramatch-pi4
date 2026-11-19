@@ -115,6 +115,40 @@ from the solved projection.
 
 Checks: `blender -b <solved.blend> --python tests/check_robust_features.py -- [zoom_job first_png gt.json]`.
 
+## Collision avoidance + imported characters without foot sliding (v0.11.0)
+**Avoid Collisions** (CG Integration, on by default) applies to *Add Walking Robot* and *Move Along Path*.
+- **Walls:** the set mesh, the street walls and static CG objects are sampled every 8 cm along their edges
+  in the body-height band (0.15–2 m above the fitted floor) into a 2D KD-tree. The path is pushed out to the
+  mover's half-width + 10 cm.
+- **Other movers:** every robot or moved object registers its per-frame footprint (an oriented rectangle).
+  A new mover's path is offset **sideways**: for each conflicting frame, a line search finds the smallest
+  offset (either side) that clears the other mover *and* the walls, and the requirements are combined with a
+  smooth envelope (max, not sum). Speeds that depend on the path length are passed as a rule, so the timing
+  stays right after a detour.
+
+**Imported characters** (any rig with foot bones and an in-place walk cycle, e.g. glTF/FBX from a library)
+with *Move Along Path*:
+- The walk cycle is analysed. Its **speed profile** is the backward motion of the planted (lowest) foot,
+  sampled over the cycle's true, fractional length. Its **forward axis** and **sole height** (median lowest
+  point) are measured too.
+- The character advances exactly as fast as its planted foot moves back, frame by frame. A set *Speed* scales
+  the cycle's playback (NLA strip) rather than sliding the feet.
+- The cycle loops through the NLA. When the curve ends before the shot does, the walk stops there and an
+  *Idle* action plays if the rig has one.
+
+Test (`tests/check_collide_walk.py`, Venice, CC0 RobotExpressive scaled to 1.7 m):
+
+| | without | with |
+|---|---|---|
+| Robot path hugging a wall: closest wall | 0.09 m | **0.38 m** |
+| Robot crossing a moving 0.8 × 1.6 m box: min footprint gap | −0.33 m (overlap) | **+0.16 m** |
+| Character planted-foot slide (median / p90) | 63 / 149 cm/s (constant speed) | **5.3 / 86 cm/s** (cycle profile) |
+| Character sole height above the floor | — | median −0.2 cm (−11…+6 cm: the cycle's own swing dips) |
+
+Limits: avoidance is lateral only. Movers never wait, so a passage too narrow for both is reported, not solved.
+Root-motion cycles are detected and flagged; use in-place cycles. The p90 slide comes from the frames where
+the lowest foot switches during heel–toe roll.
+
 ## Workflow tools (v0.10.0)
 - **Re-solve (Refine Only):** re-runs the plate-resolution tracking and bundle adjustment of the last job with the
   current settings (distortion, focal lock, zoom, rolling shutter, Ignore Mask, semantic masks), without Pi4,

@@ -92,9 +92,16 @@ for fr in range(sc.frame_start, sc.frame_end + 1, 15):
     c = box.matrix_world.translation
     errs_floor.append(abs(low - fz(c.x, c.y)))
     fwd = -(box.matrix_world.to_3x3() @ Vector((0, 1, 0)))
-    i = int(np.argmin(np.linalg.norm(pts2 - np.array(c[:2]), axis=1)))
-    t = pts2[min(i + 1, len(pts2) - 1)] - pts2[max(i - 1, 0)]
-    errs_head.append(math.degrees(abs(math.atan2(fwd.y, fwd.x) - math.atan2(t[1], t[0]))) % 360)
+    # its ACTUAL travel direction (the path may detour around the robot / the walls): motion over +-3 frames
+    sc.frame_set(min(fr + 3, sc.frame_end))
+    c2 = box.matrix_world.translation.copy()
+    sc.frame_set(max(fr - 3, sc.frame_start))
+    c1 = box.matrix_world.translation.copy()
+    sc.frame_set(fr)
+    t = (c2 - c1).xy
+    if t.length < 1e-4:
+        continue
+    errs_head.append(math.degrees(abs(math.atan2(fwd.y, fwd.x) - math.atan2(t.y, t.x))) % 360)
 check("box rests on the floor", max(errs_floor) < 0.02, f"max gap {max(errs_floor) * 100:.1f} cm")
 check("box faces its direction of travel", max(min(e, 360 - e) for e in errs_head) < 5,
       f"max heading error {max(min(e, 360 - e) for e in errs_head):.1f} deg")
