@@ -21,7 +21,7 @@ import numpy as np
 from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from mathutils import Matrix
 
-from . import robot, set_builder
+from . import ignore_mask, robot, set_builder
 
 # The work folder is the repo's ./work, mounted as /work by docker-compose. Set it in the add-on preferences,
 # or with the CAMERAMATCH_WORK environment variable.
@@ -60,7 +60,7 @@ def _start_progress(op, server_url, job):
                 p = _http(f"{url}&since={since}", timeout=2)
                 # the server may still hold this job's previous run (finished): wait until the new one starts
                 live = live or p.get("state") == "running"
-                if live:
+                if live and _STATUS["running"]:     # never overwrite the final summary after the job ended
                     _STATUS["pct"] = float(p.get("pct", 0.0))
                     _STATUS["stage"] = p.get("stage", _STATUS["stage"])
                     if p.get("msg"):
@@ -175,6 +175,10 @@ class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
                                   description="Never track features on trees, plants, water or sky (OneFormer "
                                               "semantic masks, MIT): leaves in the wind, waves and clouds are not "
                                               "static and pull the camera solve. About 25 s extra")
+    ignore_mask: PointerProperty(type=bpy.types.Mask, name="Ignore Mask",
+                                 description="A mask drawn in the Movie Clip Editor (Mask mode): no feature is tracked "
+                                             "inside it (screens, reflections, moving things Pi4 / the semantic "
+                                             "masks miss). Animated and track-parented masks are supported")
     max_tracks: IntProperty(name="Active Tracks", default=600, min=50, max=5000,
                             description="Target number of simultaneously tracked features for refinement")
     auto_matte: BoolProperty(name="Refine Matte After Solve", default=False,
@@ -521,6 +525,12 @@ class CAMERAMATCH_OT_solve(bpy.types.Operator):
                        focal_sigma=0.002 if s.lock_focal else 0.3, zoom=s.animate_focal, solver="lm",
                        rolling_shutter=s.rolling_shutter, rs_axis="auto", ignore_classes=bool(s.ignore_nonrigid))
         url = prefs.server_url.rstrip("/") + "/solve"
+        if s.ignore_mask is not None:
+            if not s.refine:
+                self.report({"WARNING"}, "Ignore Mask is used by the plate-resolution refinement: enable Refine")
+            else:
+                _STATUS["text"] = f"rasterising ignore mask '{s.ignore_mask.name}'..."
+                ignore_mask.rasterize(s.ignore_mask, clip, context.scene, self.job_dir, log=_log)
 
         def worker():
             try:
@@ -1127,6 +1137,7 @@ class CAMERAMATCH_PT_panel(bpy.types.Panel):
             layout.prop(s, "lock_focal")
             layout.prop(s, "rolling_shutter")
             layout.prop(s, "ignore_nonrigid")
+            layout.prop(s, "ignore_mask")
         layout.prop(s, "animate_focal")
         col = layout.column(align=True)
         col.prop(s, "conf_threshold")

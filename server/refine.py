@@ -363,7 +363,8 @@ def _stats(e):
 
 def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nfev=50, quality=0.001,
            focal_sigma=0.3, progress=None, solve_distortion=True, solver="lm", zoom=False, zoom_smooth=0.01,
-           zoom_anchor="pi4", holdout_frac=0.0, rolling_shutter=False, rs_axis="auto", ignore_classes=None):
+           zoom_anchor="pi4", holdout_frac=0.0, rolling_shutter=False, rs_axis="auto", ignore_classes=None,
+           job_dir=None):
     """result: dict from result.npz; cache: dict(depth [T,Hm,Wm] metric, dyn [T,Hm,Wm]).
     progress(stage, frac, msg) is called with stages 'klt' and 'ba'.
     solver: "lm" (GPU Levenberg-Marquardt + Schur complement, ba_lm.py) or "scipy" (TRF + LSMR, class BA).
@@ -371,6 +372,7 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
     rolling_shutter: solve a sensor readout time (fraction of a frame step, signed: + = top row first), the
     pose of each row following the camera's motion (phones, most CMOS video cameras). LM solver only.
     rs_axis: "rows", "cols" or "auto" (cols for portrait video: an upright phone reads out across columns).
+    job_dir: if it holds ignore_mask.json (the add-on's rasterised Ignore Mask), those pixels are never tracked.
     ignore_classes: semantic classes (ADE20K names, e.g. semantic.DEFAULT_CLASSES: trees, water, sky...) whose
     pixels are never tracked, added to Pi4's moving-object mask. Residual-based detection of non-rigid tracks
     was tried and rejected: on clean shots the natural residual spread exceeds the foliage/ground difference.
@@ -397,6 +399,21 @@ def refine(src, result, cache, log=print, max_active=600, prior_frac=0.1, max_nf
         if sem.mean() > 0.5:
             log(f"[refine] {100 * sem.mean():.0f}% of the image is masked: the remaining tracks are concentrated, "
                 "consider Solve Lens Distortion off (distortion needs tracks across the frame)")
+    if job_dir and os.path.isfile(os.path.join(job_dir, "ignore_mask.json")):
+        import json
+        meta = json.load(open(os.path.join(job_dir, "ignore_mask.json")))
+        um = np.zeros_like(dyn)
+        missing = 0
+        for k, fi in enumerate(result["frame_indices"].astype(int)):
+            pth = os.path.join(job_dir, meta["pattern"].format(int(fi) + int(meta["first_scene_frame"])))
+            m_ = cv2.imread(pth, cv2.IMREAD_GRAYSCALE)
+            if m_ is None:
+                missing += 1
+                continue
+            um[k] = cv2.resize((m_ > 127).astype(np.float32), (Wm, Hm), interpolation=cv2.INTER_NEAREST)
+        dyn = np.maximum(dyn, um)
+        log(f"[refine] ignore mask '{meta.get('mask')}': {100 * um.mean():.1f}% of the image never tracked"
+            + (f" ({missing} frames missing)" if missing else ""))
     obs, colors, plate = klt_tracks(src, result["frame_indices"], dyn, max_active=max_active, quality=quality,
                                     log=log, progress=progress)
     obs_full = obs.copy()  # every KLT observation (exported to Blender's tracker for the kept tracks)

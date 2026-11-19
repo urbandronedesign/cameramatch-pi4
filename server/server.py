@@ -259,7 +259,7 @@ def run_refine(req, started=False):
                            zoom_smooth=float(req.get("zoom_smooth", 0.01)),
                            rolling_shutter=bool(req.get("rolling_shutter", False)),
                            rs_axis=str(req.get("rs_axis", "auto")),
-                           ignore_classes=_ignore_classes(req))
+                           ignore_classes=_ignore_classes(req), job_dir=out_dir)
     PROGRESS.update(job, "write", 0.5, "writing result")
     result.update(out)
     np.savez(res_path, **result)

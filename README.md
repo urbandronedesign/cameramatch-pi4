@@ -115,6 +115,22 @@ from the solved projection.
 
 Checks: `blender -b <solved.blend> --python tests/check_robust_features.py -- [zoom_job first_png gt.json]`.
 
+## Ignore Mask (v0.9.0)
+For anything the automatic masks miss (screens, reflections, a vehicle Pi4 does not flag, a flag the model
+doesn't recognise), draw it:
+1. Movie Clip Editor → **Mask** mode → new mask → draw splines over the region. They can be animated, feathered
+   or parented to tracks, as usual.
+2. Pi4 tab → **Ignore Mask** → pick the mask → **Solve Camera**.
+
+At solve time the add-on rasterises the mask with Blender's own compositor Mask node, so it matches what the
+editor shows (640 px long side, `<job>/ignore_mask/m_####.png` + `ignore_mask.json`). The server merges it with
+Pi4's motion mask and the semantic mask: no track starts inside it.
+
+Test on the park path, with semantic masking off and a rectangle over the top half (the canopy):
+median 0.858 → **0.370 px**, holdout 1.558 → **0.512 px**. The KLT budget moves to the ground (2697 tracks).
+Checks: `tests/check_ignore_mask.py` (coordinates: mask space is 0–1 on both axes, y up; portrait and
+landscape), and `CM_IGNORE_MASK_TOP=0.5 tests/gui_solve.py` (the full UI path).
+
 ## Ignore trees / water / sky (v0.8.0, on by default)
 Leaves in the wind, waves and clouds are not static, yet they can supply most of the trackable corners. They
 then pull the camera solve, and because they are the majority, no outlier rule can reject them. *Ignore

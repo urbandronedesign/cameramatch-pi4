@@ -118,6 +118,7 @@ street walls are detected along the camera's travel direction, with no fixed +Y 
 | Lock Focal to Pi4 | off | **Turn on for slow cinema shots** (sets focal_sigma to 0.002) |
 | Zoom Lens (Animate Focal) | off | Per-frame focal with a smoothness prior; the lens is keyframed |
 | Rolling Shutter | off | Solves the readout time (CMOS, fast handheld moves). Render & Comp matches it in Cycles |
+| Ignore Mask | — | A Mask datablock drawn in the clip editor, rasterised per frame at solve time; nothing is tracked inside it |
 | Ignore Trees / Water / Sky | **on** | OneFormer semantic masks added to the motion mask. Never hurt in the tests; halved the error on foliage |
 | Active Tracks | 600 | Tested sweet spot. More tracks make the solver slower without improving accuracy |
 | Max Frames / Stride / Model Resolution | 300 / 1 / 512 | GPU budget: 300 frames ≈ 12 GB, about 80 s |
@@ -267,6 +268,13 @@ the film's own CG. A forward dolly down a street is ideal for a walking characte
 - **Non-rigid regions (foliage, water, clouds):** they can be the majority of tracks, so robust statistics
   can't remove them, and residual-based detection failed. The rigid-shot spread is larger than the foliage
   signal. What works is the **semantic** mask (OneFormer). After masking a large area, turn distortion off.
+- **Masks in Blender:**
+  - mask space is normalised 0–1 on both axes, y up, regardless of aspect;
+  - layer shape keys (animation) are operator-only, not editable as data, so evaluate masks through the
+    compositor Mask node, never by reading spline points;
+  - every mask source (Pi4 motion, semantic, user) ends up in one `dyn` array that the KLT tracker avoids.
+- **Progress poller race:** the poll thread could complete one last HTTP poll after a job ended and overwrite
+  the final summary. It now writes only while the job is running.
 - **Rolling shutter:**
   - the readout axis follows the sensor: portrait phone video reads across *columns*;
   - Cycles' rolling shutter is top-to-bottom only, with the shutter window = readout + per-row exposure;
@@ -313,8 +321,8 @@ Most of the real bugs were caught this way.
   solved cameras would fix the set geometry there.
 - The robot is built from primitives. The next step in realism is a modelled, high-detail asset that
   keeps the same rig, lighting and composite.
-- A manual "ignore" mask drawn in Blender's Mask editor, for non-rigid things the semantic classes miss
-  (screens, reflections, moving vehicles that Pi4 does not flag).
+- Product polish: a curved walk path for the robot (click points), an "Insert Asset" button for any rigged
+  character, Re-solve (refine only) from the add-on with new settings without re-running Pi4.
 - Candidates: writing tracks into Blender's clip tracker, a metric-scale fix from a known measurement,
   a curved walk path (the robot button walks a straight line), and an "Insert Asset" button for any rigged
   character.

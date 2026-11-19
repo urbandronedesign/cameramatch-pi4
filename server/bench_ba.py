@@ -78,7 +78,8 @@ def main():
                             zoom_smooth=a.zoom_smooth, zoom_anchor=a.zoom_anchor, holdout_frac=a.holdout,
                             rolling_shutter=a.rolling_shutter, rs_axis=a.rs_axis,
                             ignore_classes=(__import__("semantic").DEFAULT_CLASSES if a.ignore == "default"
-                                            else [c for c in a.ignore.split(",") if c]) or None)
+                                            else [c for c in a.ignore.split(",") if c]) or None,
+                            job_dir=a.job)
         tot = time.time() - t0
         ba_s = sum(float(l.split("evals, " if "evals" in l else "iterations, ")[1].rstrip("s"))
                    for l in lines if l.startswith("[refine] BA"))

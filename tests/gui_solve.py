@@ -49,6 +49,18 @@ def _step():
             s.solve_distortion = os.environ["CM_SOLVE_DISTORTION"] == "1"
         if "CM_LOCK_FOCAL" in os.environ:
             s.lock_focal = os.environ["CM_LOCK_FOCAL"] == "1"
+        if "CM_IGNORE_SEMANTIC" in os.environ:
+            s.ignore_nonrigid = os.environ["CM_IGNORE_SEMANTIC"] == "1"
+        if "CM_IGNORE_MASK_TOP" in os.environ:          # test mask: rectangle over the top fraction of the frame
+            top = float(os.environ["CM_IGNORE_MASK_TOP"])
+            mk = bpy.data.masks.new("ignore_top")
+            sp = mk.layers.new().splines.new()
+            sp.use_cyclic = True
+            sp.points.add(3)
+            for p, c in zip(sp.points, [(0.0, 1.0), (1.0, 1.0), (1.0, 1.0 - top), (0.0, 1.0 - top)]):
+                p.co = c
+                p.handle_type = "VECTOR"
+            s.ignore_mask = mk
         state.update(phase="invoke", area=area, clip=clip.name)
         return 1.0
     if state["phase"] == "invoke":
