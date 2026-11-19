@@ -115,6 +115,24 @@ from the solved projection.
 
 Checks: `blender -b <solved.blend> --python tests/check_robust_features.py -- [zoom_job first_png gt.json]`.
 
+## Workflow tools (v0.10.0)
+- **Re-solve (Refine Only):** re-runs the plate-resolution tracking and bundle adjustment of the last job with the
+  current settings (distortion, focal lock, zoom, rolling shutter, Ignore Mask, semantic masks), without Pi4,
+  then replaces the imported solve. Venice: 27 s, against about 2.5 min for a full solve. Clearing the Ignore Mask
+  stops it being applied on the re-solve.
+- **Add Walking Robot along a curve:** draw a curve on the floor, select it, then *Add Walking Robot*. The
+  robot walks along it at *Walk Speed* (stopping at its end). With no curve selected, it walks straight from
+  the 3D cursor toward the camera, as before.
+- **Move Along Path:** select any objects plus a curve (active), for example a vehicle or an imported character
+  with an in-place walk cycle. They are keyframed along the curve over the scene range, resting on the fitted
+  floor and facing the way they move. *Speed* 0 spreads the whole curve over the range; *Forward Axis* defaults
+  to −Y, Blender's character convention.
+
+Checks: `tests/check_paths.py`, on Venice. The robot pelvis stays within 6.2 cm of its S-curve (gait sway
+included); the box rests on the floor with a 0.0 cm gap and faces its direction of travel within 0.3°. A
+render plus comp of both shows them grounded with contact shadows. `tests/gui_resolve.py` checks Re-solve
+through the UI.
+
 ## Ignore Mask (v0.9.0)
 For anything the automatic masks miss (screens, reflections, a vehicle Pi4 does not flag, a flag the model
 doesn't recognise), draw it:

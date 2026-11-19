@@ -21,7 +21,7 @@ import numpy as np
 from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from mathutils import Matrix
 
-from . import ignore_mask, robot, set_builder
+from . import ignore_mask, paths, robot, set_builder
 
 # The work folder is the repo's ./work, mounted as /work by docker-compose. Set it in the add-on preferences,
 # or with the CAMERAMATCH_WORK environment variable.
@@ -201,6 +201,13 @@ class CAMERAMATCH_Settings(bpy.types.PropertyGroup):
     comp_soft: FloatProperty(name="CG Softness (px)", default=0.6, min=0.0, max=3.0,
                              description="Gaussian blur on the CG to match the plate's sharpness")
     comp_wrap: FloatProperty(name="Light Wrap", default=0.25, min=0.0, max=1.0)
+
+
+def _refine_settings(s):
+    """The plate-resolution refinement settings shared by Solve and Re-solve."""
+    return dict(max_tracks=s.max_tracks, solve_distortion=s.solve_distortion,
+                focal_sigma=0.002 if s.lock_focal else 0.3, zoom=s.animate_focal, solver="lm",
+                rolling_shutter=s.rolling_shutter, rs_axis="auto", ignore_classes=bool(s.ignore_nonrigid))
 
 
 def _prefs():
@@ -520,10 +527,8 @@ class CAMERAMATCH_OT_solve(bpy.types.Operator):
         clip_path = bpy.path.abspath(clip.filepath)
         payload = dict(job=job, stride=s.stride, max_frames=s.max_frames,
                        max_size=s.max_size - s.max_size % 16, track=s.track,
-                       conf_threshold=s.conf_threshold, num_points=s.num_points,
-                       refine=s.refine, max_tracks=s.max_tracks, solve_distortion=s.solve_distortion,
-                       focal_sigma=0.002 if s.lock_focal else 0.3, zoom=s.animate_focal, solver="lm",
-                       rolling_shutter=s.rolling_shutter, rs_axis="auto", ignore_classes=bool(s.ignore_nonrigid))
+                       conf_threshold=s.conf_threshold, num_points=s.num_points, refine=s.refine,
+                       **_refine_settings(s))
         url = prefs.server_url.rstrip("/") + "/solve"
         if s.ignore_mask is not None:
             if not s.refine:
@@ -579,6 +584,80 @@ class CAMERAMATCH_OT_solve(bpy.types.Operator):
         self.report({"INFO"}, "Pi4 solve imported: " + text)
         if scene.cameramatch.auto_matte:
             bpy.ops.cameramatch.refine_matte("INVOKE_DEFAULT")
+        return {"FINISHED"}
+
+
+class CAMERAMATCH_OT_resolve(bpy.types.Operator):
+    bl_idname = "cameramatch.resolve"
+    bl_label = "Re-solve (Refine Only)"
+    bl_description = ("Re-run only the plate-resolution tracking + bundle adjustment of the last solve with the current "
+                      "settings (distortion, focal lock, zoom, rolling shutter, masks), without Pi4, then re-import")
+
+    _timer = None
+    _thread = None
+
+    @classmethod
+    def poll(cls, context):
+        j = context.scene.cameramatch.last_job
+        return (context.edit_movieclip is not None and not _STATUS["running"] and bool(j)
+                and os.path.isfile(os.path.join(j, "pi4_cache.npz")))
+
+    def invoke(self, context, event):
+        s = context.scene.cameramatch
+        clip = context.edit_movieclip
+        self.job_dir = s.last_job
+        self.clip_name = clip.name
+        self.result = None
+        job = os.path.basename(os.path.normpath(self.job_dir))
+        mj = os.path.join(self.job_dir, "ignore_mask.json")
+        if s.ignore_mask is not None:
+            ignore_mask.rasterize(s.ignore_mask, clip, context.scene, self.job_dir, log=_log)
+        elif os.path.isfile(mj):
+            os.remove(mj)                                     # the mask was cleared: stop applying the old one
+            _log("ignore mask cleared for this re-solve")
+        payload = dict(job=job, **_refine_settings(s))
+        url = _prefs().server_url.rstrip("/") + "/refine"
+
+        def worker():
+            try:
+                self.result = _http(url, payload, timeout=None)
+            except Exception as e:
+                self.result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        _start_progress("Re-solve", _prefs().server_url, job)
+        _STATUS["stage"] = "klt"
+        self._thread = threading.Thread(target=worker, daemon=True)
+        self._thread.start()
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        _redraw(context)
+        if self._thread.is_alive():
+            return {"PASS_THROUGH"}
+        context.window_manager.event_timer_remove(self._timer)
+        r = self.result or {"ok": False, "error": "no result"}
+        if not r.get("ok"):
+            _end_progress(False, "Re-solve failed: " + r.get("error", "?"))
+            self.report({"ERROR"}, _STATUS["text"])
+            return {"CANCELLED"}
+        sc = context.scene
+        clip = bpy.data.movieclips[self.clip_name]
+        frame = sc.frame_current
+        remove_imported(sc, clip)
+        cam, lens, _ = import_result(sc, clip, self.job_dir, sc.cameramatch)
+        sc.frame_set(frame)
+        rr = r["refine"]
+        text = (f"re-solved in {rr.get('refine_s', '?')}s: {rr['final']['median']:.2f}px median, "
+                f"{rr['final']['p90']:.2f}px p90, f={lens:.1f}mm, k1 {rr['k1']:.3f}"
+                + (f", readout {rr.get('rolling_shutter', 0):+.2f}" if sc.cameramatch.rolling_shutter else ""))
+        if bpy.data.collections.get(set_builder.SET_COLL):
+            text += " | rebuild the set (Build Set + Lighting) for the new cameras"
+        _end_progress(True, text)
+        self.report({"INFO"}, text)
         return {"FINISHED"}
 
 
@@ -793,8 +872,8 @@ class CAMERAMATCH_OT_place_on_floor(bpy.types.Operator):
 class CAMERAMATCH_OT_add_robot(bpy.types.Operator):
     bl_idname = "cameramatch.add_robot"
     bl_label = "Add Walking Robot"
-    bl_description = ("Procedural robot walking from the 3D cursor toward the camera, feet planted on the fitted "
-                      "floor, over the scene frame range")
+    bl_description = ("Procedural robot walking over the scene frame range, feet planted on the fitted floor: along the "
+                      "selected curve (draw one on the floor), or from the 3D cursor straight toward the camera")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -804,10 +883,14 @@ class CAMERAMATCH_OT_add_robot(bpy.types.Operator):
     def execute(self, context):
         sc = context.scene
         s = sc.cameramatch
-        _log(f"===== Add Walking Robot from cursor {tuple(round(x, 2) for x in sc.cursor.location)} =====")
+        crv = context.active_object if (context.active_object is not None and context.active_object.type == "CURVE"
+                                        and context.active_object.select_get()) else None
+        _log("===== Add Walking Robot " + (f"along curve '{crv.name}'" if crv else
+                                            f"from cursor {tuple(round(x, 2) for x in sc.cursor.location)}") + " =====")
         try:
+            pxy = paths.curve_points(crv)[:, :2] if crv else None
             robot.add_walking_robot(sc, sc.cursor.location.copy(), lambda x, y: set_builder.floor_z(sc, x, y),
-                                    _log, speed=s.robot_speed, look_at_camera=s.robot_look)
+                                    _log, speed=s.robot_speed, look_at_camera=s.robot_look, path_xy=pxy)
         except Exception as e:
             self.report({"ERROR"}, f"Add robot failed: {e}")
             return {"CANCELLED"}
@@ -944,6 +1027,45 @@ class CAMERAMATCH_OT_export_tracks(bpy.types.Operator):
         msg = f"exported {len(pick)} tracks ({n_mark} markers) from {key}"
         _log(msg)
         self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class CAMERAMATCH_OT_move_along_path(bpy.types.Operator):
+    bl_idname = "cameramatch.move_along_path"
+    bl_label = "Move Along Path"
+    bl_description = ("Animate the selected objects (vehicle, character with an in-place walk cycle, prop...) along "
+                      "the ACTIVE curve over the scene frame range, standing on the fitted floor and facing the way "
+                      "they move")
+    bl_options = {"REGISTER", "UNDO"}
+
+    speed: FloatProperty(name="Speed", default=0.0, min=0.0, max=100.0, unit="VELOCITY",
+                         description="Metres per second (0 = the whole curve over the frame range)")
+    forward: bpy.props.EnumProperty(name="Forward Axis", default="-Y",
+                                    items=[("-Y", "-Y", "Blender character convention"), ("+Y", "+Y", ""),
+                                           ("+X", "+X", ""), ("-X", "-X", "")],
+                                    description="The object's local axis that should point along the path")
+
+    @classmethod
+    def poll(cls, context):
+        a = context.active_object
+        return ("cm_floor_coef" in context.scene and a is not None and a.type == "CURVE"
+                and any(o is not a for o in context.selected_objects))
+
+    def execute(self, context):
+        sc = context.scene
+        crv = context.active_object
+        sel = [o for o in context.selected_objects if o is not crv]
+        objs = [o for o in sel if o.parent not in sel]            # move the top of each hierarchy only
+        try:
+            pts = paths.curve_points(crv)
+            path, length = paths.ground_path(pts[:, :2])
+            v = paths.move_along(objs, path, length, lambda x, y: set_builder.floor_z(sc, x, y), sc,
+                                 self.speed, self.forward, log=_log)
+        except Exception as e:
+            self.report({"ERROR"}, f"Move Along Path failed: {e}")
+            return {"CANCELLED"}
+        _sync_log_text()
+        self.report({"INFO"}, f"{len(objs)} object(s) along '{crv.name}' ({length:.1f} m) at {v:.2f} m/s")
         return {"FINISHED"}
 
 
@@ -1093,6 +1215,7 @@ def draw_cg_box(layout, s):
     box.operator("cameramatch.build_set", icon="MESH_GRID")
     box.operator("cameramatch.place_on_floor", icon="SNAP_FACE")
     box.operator("cameramatch.add_robot", icon="ARMATURE_DATA")
+    box.operator("cameramatch.move_along_path", icon="CURVE_PATH")
     col = box.column(align=True)
     col.prop(s, "robot_speed")
     col.prop(s, "robot_look")
@@ -1145,7 +1268,8 @@ class CAMERAMATCH_PT_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("cameramatch.check_server", icon="URL")
         layout.operator("cameramatch.solve", icon="CAMERA_DATA")
-        layout.operator("cameramatch.reimport", icon="FILE_REFRESH")
+        layout.operator("cameramatch.resolve", icon="FILE_REFRESH")
+        layout.operator("cameramatch.reimport", icon="IMPORT")
         box = layout.box()
         box.label(text=f"Scene Scale: x{job_scale(s.last_job):.4f}" if s.last_job else "Scene Scale",
                   icon="DRIVER_DISTANCE")
@@ -1190,7 +1314,7 @@ classes = (CAMERAMATCH_Prefs, CAMERAMATCH_Settings, CAMERAMATCH_OT_check_server,
            CAMERAMATCH_OT_solve, CAMERAMATCH_OT_reimport, CAMERAMATCH_OT_refine_matte, CAMERAMATCH_OT_show_log,
            CAMERAMATCH_OT_clear_log, CAMERAMATCH_OT_build_set, CAMERAMATCH_OT_place_on_floor,
            CAMERAMATCH_OT_add_robot, CAMERAMATCH_OT_render_comp, CAMERAMATCH_OT_set_scale,
-           CAMERAMATCH_OT_export_tracks, CAMERAMATCH_PT_panel, CAMERAMATCH_PT_view3d)
+           CAMERAMATCH_OT_export_tracks, CAMERAMATCH_OT_resolve, CAMERAMATCH_OT_move_along_path, CAMERAMATCH_PT_panel, CAMERAMATCH_PT_view3d)
 
 
 def _statusbar_progress(self, context):

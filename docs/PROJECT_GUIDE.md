@@ -56,6 +56,14 @@ matte (tools)        on demand        docker compose --profile tools run --rm ma
 | `work/` | Job folders (`<clip>_<date>_<time>/`) and per-shot outputs |
 | `samples/` | Source clips. The full Tears of Steel film is in `samples/tos/` |
 
+**Workflow tools (v0.10.0):**
+- **Re-solve (Refine Only):** calls `/refine` with `_refine_settings()`, the same dict Solve uses, so the
+  two can't drift apart, then re-imports.
+- **Robot along a curve:** `paths.curve_points` walks the evaluated curve's edge chain from an open end;
+  `paths.ground_path` gives an arc-length path with a smoothed tangent.
+- **Move Along Path:** `paths.move_along` takes any objects. It moves only the top of each selected
+  hierarchy, unwraps the heading, and puts the bounding-box bottom on the fitted floor.
+
 **Robustness tools (v0.6.0):**
 - **Set Scale from Distance:** writes `<job>/scene_scale.json`. The import records the scale it actually
   applied on the scene (`cm_applied_scale`), and Set Scale computes from that, not from the file.
@@ -321,8 +329,9 @@ Most of the real bugs were caught this way.
   solved cameras would fix the set geometry there.
 - The robot is built from primitives. The next step in realism is a modelled, high-detail asset that
   keeps the same rig, lighting and composite.
-- Product polish: a curved walk path for the robot (click points), an "Insert Asset" button for any rigged
-  character, Re-solve (refine only) from the add-on with new settings without re-running Pi4.
+- Robot / Move Along Path: avoid the set walls and other CG (no collision handling yet); foot-locked walk
+  cycles for imported characters (Move Along Path slides an in-place cycle at constant speed).
+- A real-footage zoom test (only synthetic so far).
 - Candidates: writing tracks into Blender's clip tracker, a metric-scale fix from a known measurement,
   a curved walk path (the robot button walks a straight line), and an "Insert Asset" button for any rigged
   character.

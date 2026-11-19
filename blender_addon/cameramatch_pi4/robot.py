@@ -498,10 +498,12 @@ def make_materials(floor_z0):
 
 
 # ----------------------------------------------------------------------------- one-call entry (add-on button)
-def add_walking_robot(scene, start, floor_fn, log, speed=0.85, look_at_camera=True, min_dist=3.0):
-    """Robot walking in a straight line from `start` toward where the camera ends, feet on floor_fn(x, y).
+def add_walking_robot(scene, start, floor_fn, log, speed=0.85, look_at_camera=True, min_dist=3.0, path_xy=None):
+    """Robot walking from `start` toward where the camera ends (straight line), or along `path_xy` (N, 2 ground
+    points, e.g. from a drawn curve), feet on floor_fn(x, y).
 
-    Speed is capped so it stops `min_dist` m short of the camera's final position.
+    Straight line: speed is capped so it stops `min_dist` m short of the camera's final position.
+    Path: it walks at `speed` and stops at the end of the path if it gets there first.
     """
     cam = scene.camera
     f0, f1 = scene.frame_start, scene.frame_end
@@ -511,19 +513,26 @@ def add_walking_robot(scene, start, floor_fn, log, speed=0.85, look_at_camera=Tr
         scene.frame_set(fr)
         track[fr] = cam.matrix_world.translation.copy()
     scene.frame_set(f0)
-    d = Vector((track[f1].x - start.x, track[f1].y - start.y))
-    if d.length < min_dist + 0.5:
-        raise RuntimeError("3D cursor is too close to the camera: place it further down the shot")
-    dirv = d.normalized()
     dur = max((f1 - f0) / fps, 1e-3)
-    walk = min(speed * dur, d.length - min_dist)
+    if path_xy is not None:
+        from .paths import ground_path
+        path, length = ground_path(path_xy)
+        walk = min(speed * dur, length)
+        start = Vector((path_xy[0][0], path_xy[0][1], 0.0))
+        d = Vector((track[f1].x - start.x, track[f1].y - start.y))
+    else:
+        d = Vector((track[f1].x - start.x, track[f1].y - start.y))
+        if d.length < min_dist + 0.5:
+            raise RuntimeError("3D cursor is too close to the camera: place it further down the shot")
+        dirv = d.normalized()
+        walk = min(speed * dur, d.length - min_dist)
+        p0 = Vector((start.x, start.y))
+
+        def path(s):
+            return p0 + dirv * s, dirv.copy()
     v = walk / dur
     if v < 0.35:
         log(f"warning: only {walk:.1f} m to walk in {dur:.1f} s -> slow gait ({v:.2f} m/s)")
-    p0 = Vector((start.x, start.y))
-
-    def path(s):
-        return p0 + dirv * s, dirv.copy()
 
     coll = bpy.data.collections.new("CM_Robot")
     scene.collection.children.link(coll)
@@ -539,6 +548,9 @@ def add_walking_robot(scene, start, floor_fn, log, speed=0.85, look_at_camera=Tr
     finally:
         ed.keyframe_new_interpolation_type = old
     scene.frame_set(f0)
-    log(f"robot '{coll.name}': walks {walk:.1f} m at {v:.2f} m/s, ends {d.length - walk:.1f} m from the camera "
+    end_p, _ = path(walk)
+    end_d = (Vector((track[f1].x, track[f1].y)) - end_p).length
+    log(f"robot '{coll.name}': walks {walk:.1f} m at {v:.2f} m/s{' along the curve' if path_xy is not None else ''}, "
+        f"ends {end_d:.1f} m from the camera "
         f"(leg reach max {stats['max_ratio'] * 100:.0f}%, {stats['clamped']} clamped)")
     return coll, stats
