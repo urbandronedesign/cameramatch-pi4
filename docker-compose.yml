@@ -1,0 +1,67 @@
+services:
+  pi4:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: cameramatch-pi4:latest
+    ports:
+      - "127.0.0.1:8765:8765"   # localhost only
+    volumes:
+      - ./work:/work             # shared with the Blender add-on
+      - pi4-cache:/cache         # Hugging Face weights cache
+    shm_size: 8gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  matte:                       # on-demand tools: docker compose run --rm matte python /tools/...
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.matte
+    image: cameramatch-matte:latest
+    volumes:
+      - ./work:/work
+      - ./tools:/tools
+      - matte-cache:/cache       # SAM2 / MatAnyone2 weights
+    shm_size: 8gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  matte-server:                # SAM 2.1 + MatAnyone 2 for the add-on's "Refine Matte" button
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.matte
+    image: cameramatch-matte:latest
+    depends_on: [pi4]
+    command: ["python", "/tools/matte_server.py"]
+    working_dir: /tools
+    ports:
+      - "127.0.0.1:8766:8766"
+    volumes:
+      - ./work:/work
+      - ./tools:/tools
+      - matte-cache:/cache
+    shm_size: 8gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  pi4-cache:
+  matte-cache:

@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "cameramatch_pi4"
+version = "0.5.0"
+name = "CameraMatch Pi4"
+tagline = "Automatic camera solve from a movie clip using the Pi4 model"
+maintainer = "CameraMatch contributors"
+type = "add-on"
+
+blender_version_min = "5.1.0"
+
+# The add-on code is GPL. The Pi4 model/weights it talks to are CC BY-NC 4.0
+# (non-commercial) and are NOT distributed with this add-on.
+license = ["SPDX:GPL-3.0-or-later"]
+
+tags = ["Tracking", "Camera"]
+
+[permissions]
+network = "Talks to the local Pi4 inference server"
+files = "Copy clips to the shared work folder and read solve results"

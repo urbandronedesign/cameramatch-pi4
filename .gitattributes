@@ -1,0 +1,6 @@
+# Keep LF everywhere (scripts run in Linux containers and Blender; avoids CRLF churn on Windows)
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zip binary
+*.blend binary

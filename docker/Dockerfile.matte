@@ -1,0 +1,36 @@
+# Foreground matte refinement tools: SAM 2.1 (Apache-2.0) + MatAnyone 2 (NTU S-Lab License 1.0, non-commercial).
+# Separate image so their dependencies never disturb the Pi4 server.
+FROM nvidia/cuda:13.0.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 \
+    TORCH_CUDA_ARCH_LIST="12.0" SAM2_BUILD_CUDA=0 \
+    HF_HOME=/cache/huggingface TORCH_HOME=/cache/torch
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential curl ca-certificates libgl1 libglib2.0-0 libegl1 libxkbcommon0 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv venv /opt/venv --python 3.11
+ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
+RUN uv pip install "torch==2.12.1" torchvision --index-url ${TORCH_INDEX} \
+    && uv pip install setuptools wheel hatchling
+# Pin torch for everything that follows (Blackwell needs the cu130 build).
+RUN python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__)" \
+    && python -c "import torch; open('/opt/constraints.txt','w').write(f'torch=={torch.__version__}\n')"
+
+ARG SAM2_COMMIT=main
+RUN git clone https://github.com/facebookresearch/sam2 /opt/sam2 && git -C /opt/sam2 checkout ${SAM2_COMMIT} \
+    && cd /opt/sam2 && uv pip install --no-build-isolation --no-sources -c /opt/constraints.txt -e .
+ARG MATANYONE2_COMMIT=main
+RUN git clone https://github.com/pq-yang/MatAnyone2 /opt/MatAnyone2 \
+    && git -C /opt/MatAnyone2 checkout ${MATANYONE2_COMMIT} \
+    && cd /opt/MatAnyone2 && uv pip install --no-sources -c /opt/constraints.txt -e .
+RUN uv pip install -c /opt/constraints.txt opencv-python-headless scipy open3d \
+    && python -c "import torch; assert torch.__version__.endswith('cu130'), torch.__version__; print('torch ok', torch.__version__)"
+
+# OpenEXR: reads the multilayer EXR renders (robot comp)
+RUN uv pip install OpenEXR
+
+WORKDIR /work
